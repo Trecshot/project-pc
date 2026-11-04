@@ -9,6 +9,7 @@ from datacleaner.rules import select_file_to_keep, KeepRule
 from datacleaner.quarantine import (
     quarantine_redundant_files,
     restore_from_quarantine,
+    find_quarantine_sessions,
     QuarantineResult,
     RestoreResult
 )
@@ -31,6 +32,7 @@ __all__ = [
     "KeepRule",
     "quarantine_redundant_files",
     "restore_from_quarantine",
+    "find_quarantine_sessions",
     "QuarantineResult",
     "RestoreResult",
     "build_audit_plan",

@@ -4,15 +4,15 @@ DataCleaner GUI
 
 Implementación bajo arquitectura Zero-Class-Rewrite sobre ttk estándar,
 inyectando el tema Sun Valley (Fluent Design Windows 11) mediante sv-ttk.
-Incluye soporte nativo de modo oscuro/claro, validación en línea de rutas,
-aislamiento de tecnicismos, tarjetas Card.TFrame de alto contraste (WCAG)
-y Call to Action con estilo Accent.TButton.
+Incluye modal interactivo de restauración por sesiones (RestoreModal),
+soporte nativo de modo oscuro/claro, validación en línea de rutas,
+tarjetas Card.TFrame de alto contraste (WCAG) y Call to Action con estilo Accent.TButton.
 """
 
 import os
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from tkinter.scrolledtext import ScrolledText
@@ -30,6 +30,7 @@ from datacleaner.hasher import get_safe_worker_count
 from datacleaner.quarantine import (
     quarantine_redundant_files,
     restore_from_quarantine,
+    find_quarantine_sessions,
     QuarantineResult,
     RestoreResult
 )
@@ -47,6 +48,280 @@ RULE_OPTIONS = {
     "Solo el archivo más reciente": KeepRule.NEWEST_ONLY.value,
     "Solo el archivo más antiguo": KeepRule.OLDEST_ONLY.value,
 }
+
+class RestoreModal(tk.Toplevel):
+    """
+    Modal Toplevel exclusivo para selección y restauración de sesiones de cuarentena.
+    Escanea carpetas _quarantine_* locales y presenta un Treeview tabular sin requerir
+    conocimientos técnicos del sistema de archivos subyacente.
+    """
+    def __init__(
+        self,
+        parent: tk.Tk | tk.Widget,
+        base_dir: Path | str,
+        on_restore_success: Callable[[], None] | None = None
+    ):
+        super().__init__(parent)
+        self.parent = parent
+        self.base_dir = Path(base_dir).resolve().absolute()
+        self.on_restore_success = on_restore_success
+
+        self.title("Restaurar Sesión de Cuarentena - DataCleaner")
+        self.geometry("780x520")
+        self.minsize(660, 420)
+
+        # Modal exclusivo sobre la ventana principal
+        self.transient(parent)
+        self.grab_set()
+
+        self.sessions: list[dict] = []
+        self.selected_session: dict | None = None
+
+        self._build_ui()
+        self._load_sessions()
+
+    def _build_ui(self):
+        container = ttk.Frame(self, padding=(20, 16))
+        container.pack(fill="both", expand=True)
+
+        # 1. Área de Instrucción
+        ttk.Label(
+            container,
+            text="Restauración de Cuarentena",
+            font=("Segoe UI", 14, "bold")
+        ).pack(anchor="w")
+
+        ttk.Label(
+            container,
+            text="Seleccione una sesión de cuarentena para devolver los archivos a su ubicación original.",
+            font=("Segoe UI", 10)
+        ).pack(anchor="w", pady=(2, 10))
+
+        # Directorio base explorado con opción de cambio
+        dir_frame = ttk.Frame(container, style="Card.TFrame", padding=(10, 6))
+        dir_frame.pack(fill="x", pady=(0, 10))
+
+        ttk.Label(
+            dir_frame,
+            text="Directorio auditado:",
+            font=("Segoe UI", 9, "bold")
+        ).pack(side="left", padx=(0, 6))
+
+        self.dir_lbl = ttk.Label(
+            dir_frame,
+            text=str(self.base_dir),
+            font=("Segoe UI", 9)
+        )
+        self.dir_lbl.pack(side="left", fill="x", expand=True)
+
+        change_dir_btn = ttk.Button(
+            dir_frame,
+            text="Cambiar...",
+            command=self._change_search_dir,
+            width=10
+        )
+        change_dir_btn.pack(side="right")
+
+        # 2. Treeview de Sesiones (Tabla)
+        # Columna 1: Fecha y Hora | Columna 2: Cantidad de Archivos | Columna 3: Espacio Total
+        table_frame = ttk.Frame(container)
+        table_frame.pack(fill="both", expand=True, pady=(0, 10))
+
+        columns = ("timestamp", "files", "bytes", "session")
+        self.tree = ttk.Treeview(
+            table_frame,
+            columns=columns,
+            show="headings",
+            selectmode="browse",
+            style="Data.Treeview"
+        )
+
+        self.tree.heading("timestamp", text="Fecha y Hora")
+        self.tree.heading("files", text="Cantidad de Archivos")
+        self.tree.heading("bytes", text="Espacio Total")
+        self.tree.heading("session", text="Sesión")
+
+        self.tree.column("timestamp", width=180, anchor="center")
+        self.tree.column("files", width=150, anchor="center")
+        self.tree.column("bytes", width=130, anchor="e")
+        self.tree.column("session", width=220, anchor="w")
+
+        scroll_y = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scroll_y.set)
+
+        self.tree.pack(side="left", fill="both", expand=True)
+        scroll_y.pack(side="right", fill="y")
+
+        self.tree.bind("<<TreeviewSelect>>", self._on_session_selected)
+
+        # 3. Resumen Dinámico de Selección
+        self.summary_card = ttk.Frame(container, style="Card.TFrame", padding=(12, 8))
+        self.summary_card.pack(fill="x", pady=(0, 12))
+
+        self.summary_lbl = ttk.Label(
+            self.summary_card,
+            text="Ninguna sesión seleccionada. Haga clic en una fila de la tabla.",
+            font=("Segoe UI", 9, "bold")
+        )
+        self.summary_lbl.pack(anchor="w")
+
+        # 4. Barra de Progreso
+        self.prog_bar = ttk.Progressbar(container, mode="indeterminate")
+
+        # 5. Botones de Acción
+        btn_bar = ttk.Frame(container)
+        btn_bar.pack(fill="x")
+
+        self.restore_btn = ttk.Button(
+            btn_bar,
+            text="Restaurar Sesión Seleccionada",
+            style="Accent.TButton",
+            state="disabled",
+            command=self._execute_restore
+        )
+        self.restore_btn.pack(side="left", padx=(0, 10))
+
+        cancel_btn = ttk.Button(
+            btn_bar,
+            text="Cancelar",
+            command=self.destroy
+        )
+        cancel_btn.pack(side="left")
+
+        manual_btn = ttk.Button(
+            btn_bar,
+            text="Examinar manifest.json...",
+            command=self._browse_manual_manifest
+        )
+        manual_btn.pack(side="right")
+
+    def _load_sessions(self):
+        """Escanea localmente las carpetas _quarantine_* y carga los metadatos."""
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        self.selected_session = None
+        self.restore_btn.configure(state="disabled")
+
+        self.sessions = find_quarantine_sessions(self.base_dir)
+
+        if not self.sessions:
+            self.summary_lbl.configure(
+                text="No se encontraron sesiones de cuarentena (_quarantine_*) en este directorio."
+            )
+            return
+
+        for idx, s in enumerate(self.sessions):
+            self.tree.insert(
+                "",
+                tk.END,
+                iid=str(idx),
+                values=(
+                    s["timestamp"],
+                    f"{s['total_files']} archivos",
+                    s["total_bytes_formatted"],
+                    s["session_id"]
+                )
+            )
+
+        self.summary_lbl.configure(
+            text=f"Se encontraron {len(self.sessions)} sesiones disponibles. Seleccione una para ver su detalle."
+        )
+
+    def _on_session_selected(self, event):
+        selected = self.tree.selection()
+        if not selected:
+            self.selected_session = None
+            self.restore_btn.configure(state="disabled")
+            self.summary_lbl.configure(text="Ninguna sesión seleccionada.")
+            return
+
+        idx = int(selected[0])
+        self.selected_session = self.sessions[idx]
+
+        # Resumen visual dinámico: Ej. "569 archivos, 437.14 KB"
+        s = self.selected_session
+        self.summary_lbl.configure(
+            text=f"Sesión seleccionada: {s['total_files']} archivos, {s['total_bytes_formatted']} "
+                 f"({s['timestamp']}) en {s['folder_name']}"
+        )
+        self.restore_btn.configure(state="normal")
+
+    def _change_search_dir(self):
+        chosen = filedialog.askdirectory(title="Seleccionar directorio donde buscar cuarentenas", parent=self)
+        if chosen:
+            self.base_dir = Path(chosen).resolve().absolute()
+            self.dir_lbl.configure(text=str(self.base_dir))
+            self._load_sessions()
+
+    def _browse_manual_manifest(self):
+        manifest_file = filedialog.askopenfilename(
+            title="Seleccionar archivo manifest.json",
+            filetypes=[("Archivo Manifiesto JSON", "manifest*.json"), ("Todos los archivos", "*.*")],
+            parent=self
+        )
+        if manifest_file:
+            self._do_restore(manifest_file)
+
+    def _execute_restore(self):
+        if not self.selected_session:
+            return
+
+        s = self.selected_session
+        confirm = messagebox.askyesno(
+            "Confirmar Restauración Reversible",
+            f"¿Desea restaurar la sesión '{s['session_id']}'?\n\n"
+            f"• Archivos a devolver a su origen: {s['total_files']}\n"
+            f"• Espacio a recuperar: {s['total_bytes_formatted']}\n\n"
+            f"Al finalizar, la carpeta de cuarentena vacía será eliminada automáticamente.",
+            icon="question",
+            parent=self
+        )
+        if not confirm:
+            return
+
+        self._do_restore(s["manifest_path"])
+
+    def _do_restore(self, manifest_path: Path | str):
+        self.restore_btn.configure(state="disabled")
+        self.prog_bar.pack(fill="x", pady=(0, 8))
+        self.prog_bar.start()
+
+        def worker():
+            try:
+                res = restore_from_quarantine(manifest_path)
+                self.after(0, lambda: self._on_restore_done(res))
+            except Exception as e:
+                self.after(0, lambda: self._on_restore_error(e))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_restore_done(self, res: RestoreResult):
+        self.prog_bar.stop()
+        self.prog_bar.pack_forget()
+
+        msg = f"Se restauraron exitosamente {res.total_restored} archivos ({format_bytes(res.total_bytes_restored)}) a sus ubicaciones originales."
+        if res.quarantine_folder_removed:
+            msg += "\n\n✔ La carpeta de cuarentena vacía ha sido eliminada del disco."
+
+        if res.errors:
+            msg += f"\n\nAdvertencias / Conflictos ({len(res.errors)}):\n"
+            for err in res.errors[:3]:
+                msg += f"• {err}\n"
+
+        messagebox.showinfo("Restauración Completada", msg, parent=self)
+
+        if self.on_restore_success:
+            self.on_restore_success()
+
+        self.destroy()
+
+    def _on_restore_error(self, exc: Exception):
+        self.prog_bar.stop()
+        self.prog_bar.pack_forget()
+        self.restore_btn.configure(state="normal")
+        messagebox.showerror("Error al Restaurar", f"No se pudo completar la restauración: {exc}", parent=self)
+
 
 class DataCleanerGUI:
     def __init__(self, root: tk.Tk, initial_dir: str | None = None):
@@ -94,16 +369,12 @@ class DataCleanerGUI:
         """Configuración de tipografías y colores de alto contraste WCAG."""
         style = ttk.Style(self.root)
 
-        is_dark = (self.current_theme == "dark")
-
-        # Configuración de etiquetas y tarjetas
         style.configure("HeaderTitle.TLabel", font=("Segoe UI", 18, "bold"))
         style.configure("HeaderSubtitle.TLabel", font=("Segoe UI", 10))
         style.configure("CardTitle.TLabel", font=("Segoe UI", 9, "bold"))
         style.configure("CardValue.TLabel", font=("Segoe UI", 18, "bold"))
         style.configure("AccentValue.TLabel", font=("Segoe UI", 18, "bold"))
 
-        # Configuración de Treeview con altura generosa
         style.configure("Data.Treeview", rowheight=28, font=("Segoe UI", 9))
         style.configure("Data.Treeview.Heading", font=("Segoe UI", 9, "bold"))
 
@@ -116,26 +387,14 @@ class DataCleanerGUI:
         self._update_tag_colors()
 
     def _build_interface(self):
-        # Contenedor principal con márgenes amplios (padx=20, pady=16)
         self.main_frame = ttk.Frame(self.root, padding=(20, 16))
         self.main_frame.pack(fill="both", expand=True)
 
-        # 1. Cabecera con lenguaje instruccional directo y botón de tema
         self._build_header()
-
-        # 2. Panel de Selección y Validación en Línea
         self._build_selection_card()
-
-        # 3. Barra de Acciones con Call to Action (CTA) destacado
         self._build_action_bar()
-
-        # 4. Tarjetas de Estadísticas (Dashboard WCAG)
         self._build_dashboard_cards()
-
-        # 5. Barra de Progreso y Estado Operativo
         self._build_progress_area()
-
-        # 6. Pestañas de Resultados (Duplicados y Bitácora)
         self._build_notebook_tabs()
 
     def _build_header(self):
@@ -151,14 +410,12 @@ class DataCleanerGUI:
             style="HeaderTitle.TLabel"
         ).pack(anchor="w")
 
-        # Lenguaje guiado paso a paso para usuarios no técnicos
         ttk.Label(
             text_frame,
             text="1. Seleccione una carpeta.  2. Escanee en busca de duplicados.  Ningún archivo será borrado sin su confirmación.",
             style="HeaderSubtitle.TLabel"
         ).pack(anchor="w", pady=(2, 0))
 
-        # Botón de alternancia de tema (Modo Claro / Oscuro)
         theme_btn = ttk.Button(
             header_frame,
             text="🌓 Tema",
@@ -168,11 +425,9 @@ class DataCleanerGUI:
         theme_btn.pack(side="right", anchor="e")
 
     def _build_selection_card(self):
-        # Panel contenedor estilo Card
         self.card_selection = ttk.Frame(self.main_frame, style="Card.TFrame", padding=14)
         self.card_selection.pack(fill="x", pady=(0, 12))
 
-        # Fila 1: Selección de carpeta
         row_browse = ttk.Frame(self.card_selection)
         row_browse.pack(fill="x", pady=(0, 6))
 
@@ -194,7 +449,7 @@ class DataCleanerGUI:
         )
         browse_btn.pack(side="left")
 
-        # Fila 2: Texto de validación en línea (Evita popups bloqueantes)
+        # Texto de validación en línea
         self.validation_label = ttk.Label(
             self.card_selection,
             text="Por favor seleccione una carpeta para comenzar.",
@@ -202,7 +457,7 @@ class DataCleanerGUI:
         )
         self.validation_label.pack(anchor="w", pady=(0, 6))
 
-        # Fila 3: Opciones Avanzadas Colapsables (Aislamiento de tecnicismos)
+        # Opciones avanzadas
         self.adv_btn = ttk.Button(
             self.card_selection,
             text="⚙ Opciones avanzadas ▼",
@@ -211,9 +466,7 @@ class DataCleanerGUI:
         )
         self.adv_btn.pack(anchor="w")
 
-        # Panel colapsable interno
         self.advanced_frame = ttk.Frame(self.card_selection, padding=(0, 8))
-
         row_adv = ttk.Frame(self.advanced_frame)
         row_adv.pack(fill="x")
 
@@ -233,7 +486,6 @@ class DataCleanerGUI:
         self.rule_combobox.current(0)
         self.rule_combobox.pack(side="left", padx=(0, 16))
 
-        # Hilos I/O automáticos
         default_workers = get_safe_worker_count()
         ttk.Label(
             row_adv,
@@ -245,17 +497,17 @@ class DataCleanerGUI:
         action_bar = ttk.Frame(self.main_frame)
         action_bar.pack(fill="x", pady=(0, 12))
 
-        # Call to Action (CTA) Principal: Estilo Accent.TButton destacado
+        # CTA Principal
         self.scan_btn = ttk.Button(
             action_bar,
             text="🔍 Iniciar Simulación",
             style="Accent.TButton",
             command=self._start_scan_thread,
-            state="disabled"  # Inicia deshabilitado hasta contar con carpeta válida
+            state="disabled"
         )
         self.scan_btn.pack(side="left", padx=(0, 8))
 
-        # Botón Cuarentena: Secundario hasta que el escaneo detecte duplicados
+        # Botón Cuarentena
         self.quarantine_btn = ttk.Button(
             action_bar,
             text="📦 Enviar a Cuarentena",
@@ -264,11 +516,11 @@ class DataCleanerGUI:
         )
         self.quarantine_btn.pack(side="left", padx=(0, 8))
 
-        # Botón Restaurar: Secundario estándar
+        # Botón Restaurar -> Inicia el Flujo de Selección de Sesión (RestoreModal)
         self.restore_btn = ttk.Button(
             action_bar,
             text="🔄 Restaurar desde Cuarentena",
-            command=self._restore_from_manifest
+            command=self._open_restore_modal
         )
         self.restore_btn.pack(side="left", padx=(0, 8))
 
@@ -327,11 +579,9 @@ class DataCleanerGUI:
         self.notebook.add(tab_dups, text=" Duplicados Encontrados ")
         self.notebook.add(tab_log, text=" Bitácora de Registro ")
 
-        # Pestaña 1: Tabla simplificada de datos (sin ruido de hash de 64 caracteres)
         table_container = ttk.Frame(tab_dups)
         table_container.pack(fill="both", expand=True)
 
-        # Dimensiones priorizadas: Grupo, Acción, Tamaño, Hash (8 car.), Ruta
         columns = ("group", "action", "size", "hash_short", "path")
         self.tree = ttk.Treeview(
             table_container,
@@ -363,7 +613,6 @@ class DataCleanerGUI:
 
         self._update_tag_colors()
 
-        # Pestaña 2: Bitácora de Registro
         self.log_text = ScrolledText(
             tab_log,
             wrap="word",
@@ -374,7 +623,6 @@ class DataCleanerGUI:
         self.log_text.pack(fill="both", expand=True)
 
     def _update_tag_colors(self):
-        """Asigna colores de fila según el tema oscuro o claro."""
         is_dark = (self.current_theme == "dark")
         keep_bg = "#0f392b" if is_dark else "#d1fae5"
         keep_fg = "#a7f3d0" if is_dark else "#065f46"
@@ -406,10 +654,6 @@ class DataCleanerGUI:
             self._validate_path_input(chosen)
 
     def _validate_path_input(self, path_str: str) -> bool:
-        """
-        Validación de entrada en línea (Inline Validation):
-        Actualiza el mensaje en tiempo real sin popups bloqueantes.
-        """
         if not path_str:
             self.validation_label.configure(
                 text="Por favor seleccione una carpeta para comenzar."
@@ -468,7 +712,6 @@ class DataCleanerGUI:
         self.progress_bar["value"] = 0
         self.status_label.configure(text="Iniciando escaneo y análisis por tamaño...")
 
-        # Limpiar tabla
         for item in self.tree.get_children():
             self.tree.delete(item)
 
@@ -514,12 +757,10 @@ class DataCleanerGUI:
         self.card_redundant.configure(text=str(meta["total_redundant_files"]))
         self.card_recoverable.configure(text=meta["recoverable_formatted"])
 
-        # Poblar tabla simplificada (sin ruido del hash de 64 chars)
         for idx, g in enumerate(report["groups"], start=1):
             short_hash = g["hash_sha256"][:8] + "…"
             f_size = g["file_size_formatted"]
 
-            # Fila conservada
             self.tree.insert(
                 "",
                 tk.END,
@@ -527,7 +768,6 @@ class DataCleanerGUI:
                 tags=("keep",)
             )
 
-            # Filas redundantes
             for q_file in g["quarantine_files"]:
                 self.tree.insert(
                     "",
@@ -537,7 +777,6 @@ class DataCleanerGUI:
                 )
 
         if meta["total_redundant_files"] > 0:
-            # Activar botón de cuarentena
             self.quarantine_btn.configure(state="normal", style="Accent.TButton")
             self.status_label.configure(
                 text=f"Simulación completa: {meta['total_redundant_files']} archivos redundantes detectados. "
@@ -559,7 +798,6 @@ class DataCleanerGUI:
         total_redundant = self.last_report["metadata"]["total_redundant_files"]
         rec_str = self.last_report["metadata"]["recoverable_formatted"]
 
-        # Confirmación amigable para el usuario
         resp = messagebox.askyesno(
             "Confirmar Cuarentena (Soft-Delete)",
             f"¿Desea mover {total_redundant} archivos duplicados ({rec_str}) a la carpeta de aislamiento?\n\n"
@@ -584,6 +822,7 @@ class DataCleanerGUI:
             messagebox.showinfo(
                 "Cuarentena Exitosa",
                 f"Se trasladaron {res.total_moved} archivos ({format_bytes(res.total_bytes_moved)}) a la carpeta de cuarentena.\n\n"
+                f"Sesión: {res.session_id}\n"
                 f"Ubicación:\n{res.quarantine_dir}\n\n"
                 f"Puede restaurarlos en cualquier momento utilizando el botón 'Restaurar desde Cuarentena'."
             )
@@ -592,33 +831,23 @@ class DataCleanerGUI:
         except Exception as e:
             messagebox.showerror("Error en Cuarentena", f"Ocurrió un error al mover los archivos: {e}")
 
-    def _restore_from_manifest(self):
-        manifest_file = filedialog.askopenfilename(
-            title="Seleccionar archivo manifest.json de Cuarentena",
-            filetypes=[("Archivo Manifiesto JSON", "manifest*.json"), ("Todos los archivos", "*.*")]
+    def _open_restore_modal(self):
+        """
+        Fase 1 y 2: Invocación y apertura del Modal de Restauración Reversible (RestoreModal).
+        Explora las sesiones locales _quarantine_* del directorio actual.
+        """
+        search_dir = self.current_base_dir or Path.cwd()
+        RestoreModal(
+            parent=self.root,
+            base_dir=search_dir,
+            on_restore_success=self._on_modal_restore_success
         )
-        if not manifest_file:
-            return
 
-        try:
-            res: RestoreResult = restore_from_quarantine(manifest_file)
-            self._log(f"\n✔ Restauración completada: {res.total_restored} archivos devueltos a sus rutas originales.")
-            if res.errors:
-                for err in res.errors:
-                    self._log(f"  [ADVERTENCIA] {err}")
-
-            messagebox.showinfo(
-                "Restauración Completada",
-                f"Se restauraron {res.total_restored} archivos ({format_bytes(res.total_bytes_restored)}).\n"
-                f"Archivos previamente restaurados: {res.skipped_count}\n"
-                f"Conflictos o errores: {len(res.errors)}"
-            )
-
-            if self.current_base_dir:
-                self._start_scan_thread()
-
-        except Exception as e:
-            messagebox.showerror("Error al Restaurar", f"No se pudo completar la restauración: {e}")
+    def _on_modal_restore_success(self):
+        """Callback invocado tras una restauración exitosa en el modal."""
+        self._log("\n✔ Restauración de sesión ejecutada exitosamente desde el modal interactivo.")
+        if self.current_base_dir:
+            self._start_scan_thread()
 
     def _export_json_report(self):
         if not self.last_report:

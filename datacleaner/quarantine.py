@@ -3,9 +3,10 @@ Subsistema de Cuarentena y Restauración Automatizada (Hardened Soft-Delete & Re
 DataCleaner CLI/GUI
 
 Traslada archivos redundantes a un directorio aislado preservando su árbol relativo,
-incorporando resolución de colisiones de nombres mediante sufijos de unicidad (Zero Overwrite)
-y persistencia reversible mediante manifest.json codificado estrictamente en UTF-8.
-Cumple con RF-06 y las directrices de hardening.
+incorporando resolución de colisiones de nombres mediante sufijos de unicidad (Zero Overwrite),
+persistencia de metadatos estandarizados en manifest.json y motor de escaneo de sesiones
+para restauración reversible mediante modal interactivo.
+Cumple con RF-06 y las especificaciones de flujo de restauración interactivo.
 """
 
 from pathlib import Path
@@ -13,12 +14,13 @@ from datetime import datetime
 import json
 import shutil
 import os
+import math
 from dataclasses import dataclass, asdict
 
 @dataclass
 class QuarantineItem:
     original_path: str
-    quarantined_path: str
+    quarantine_path: str
     relative_path: str
     hash_sha256: str
     size_bytes: int
@@ -28,6 +30,7 @@ class QuarantineItem:
 
 @dataclass
 class QuarantineResult:
+    session_id: str
     quarantine_dir: Path
     manifest_path: Path
     total_moved: int
@@ -41,19 +44,36 @@ class RestoreResult:
     total_restored: int
     total_bytes_restored: int
     skipped_count: int
+    quarantine_folder_removed: bool
     errors: list[str]
 
-def create_quarantine_directory(base_dir: Path, custom_parent: Path | None = None) -> Path:
+def _format_bytes(bytes_count: int) -> str:
+    """Convierte bytes a formato legible (B, KB, MB, GB)."""
+    if bytes_count <= 0:
+        return "0 B"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    i = int(math.floor(math.log(bytes_count, 1024)))
+    p = math.pow(1024, i)
+    s = round(bytes_count / p, 2)
+    unit = units[i] if i < len(units) else "PB"
+    return f"{s} {unit}"
+
+def create_quarantine_directory(base_dir: Path, custom_parent: Path | None = None) -> tuple[Path, str, str]:
     """
     Crea un directorio de cuarentena con marca de tiempo única.
-    Ejemplo: ./_quarantine_20261104_154500/
+    Retorna (quarantine_dir, session_id, timestamp_iso).
+    Ejemplo: ./_quarantine_20261104_163151/
     """
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    folder_name = f"_quarantine_{timestamp}"
+    now = datetime.now()
+    timestamp_str = now.strftime("%Y%m%d_%H%M%S")
+    timestamp_iso = now.strftime("%Y-%m-%dT%H:%M:%S")
+    session_id = f"quarantine_{timestamp_str}"
+    folder_name = f"_{session_id}"
+
     parent = custom_parent if custom_parent else base_dir
     quarantine_dir = (parent / folder_name).resolve().absolute()
     quarantine_dir.mkdir(parents=True, exist_ok=True)
-    return quarantine_dir
+    return quarantine_dir, session_id, timestamp_iso
 
 def quarantine_redundant_files(
     base_dir: Path,
@@ -61,12 +81,8 @@ def quarantine_redundant_files(
     custom_quarantine_dir: Path | None = None
 ) -> QuarantineResult:
     """
-    Ejecuta el traslado no destructivo (soft-delete) de los archivos redundantemente detectados.
-    
-    Hardening:
-    - Réplica exacta de la jerarquía relativa de carpetas.
-    - Resolución de colisiones si el archivo de destino ya existiera (añade sufijo de hash y contador).
-    - Serialización de metadatos estrictamente en UTF-8 para soporte de acentos y caracteres especiales.
+    Ejecuta el traslado no destructivo (soft-delete) de los archivos redundantes.
+    Genera el manifest.json estructurado con session_id, timestamp, total_files, total_bytes y files.
 
     Args:
         base_dir: Directorio base auditado.
@@ -76,7 +92,14 @@ def quarantine_redundant_files(
     Returns:
         QuarantineResult con detalles de la operación y el archivo manifest.json generado.
     """
-    quarantine_dir = custom_quarantine_dir or create_quarantine_directory(base_dir)
+    if custom_quarantine_dir:
+        quarantine_dir = Path(custom_quarantine_dir).resolve().absolute()
+        quarantine_dir.mkdir(parents=True, exist_ok=True)
+        session_id = quarantine_dir.name.lstrip("_")
+        timestamp_iso = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    else:
+        quarantine_dir, session_id, timestamp_iso = create_quarantine_directory(base_dir)
+
     manifest_path = quarantine_dir / "manifest.json"
 
     items: list[QuarantineItem] = []
@@ -99,15 +122,13 @@ def quarantine_redundant_files(
                 try:
                     rel_path = orig_path.relative_to(base_dir.resolve().absolute())
                 except ValueError:
-                    # En caso de estar en una raíz diferente, se replica la ruta normalizada
                     rel_path = Path(str(orig_path).replace(":", ""))
                     if rel_path.is_absolute():
                         rel_path = rel_path.relative_to(rel_path.anchor)
 
                 dest_file = (quarantine_dir / rel_path).resolve().absolute()
 
-                # Prevención estricta de colisiones (Zero Overwrite):
-                # Si dest_file ya existiese, añadir sufijo para nunca sobrescribir
+                # Prevención de colisiones: si dest_file ya existe, genera sufijo único
                 if dest_file.exists():
                     parent_dir = dest_file.parent
                     stem = dest_file.stem
@@ -129,7 +150,7 @@ def quarantine_redundant_files(
 
                 item = QuarantineItem(
                     original_path=str(orig_path),
-                    quarantined_path=str(dest_file),
+                    quarantine_path=str(dest_file),
                     relative_path=str(rel_path),
                     hash_sha256=file_hash,
                     size_bytes=file_size,
@@ -143,21 +164,25 @@ def quarantine_redundant_files(
             except Exception as e:
                 errors.append(f"Error moviendo '{orig_path}' a cuarentena: {str(e)}")
 
-    # Guardar manifiesto de estado en formato JSON con codificación UTF-8 estricta
+    # Estructura del manifiesto según especificación técnica
+    files_list = [asdict(i) for i in items]
     manifest_data = {
-        "format_version": "1.0",
-        "timestamp": datetime.now().isoformat(),
+        "session_id": session_id,
+        "timestamp": timestamp_iso,
         "base_dir": str(base_dir.resolve().absolute()),
         "quarantine_dir": str(quarantine_dir.resolve().absolute()),
         "total_files": total_moved,
         "total_bytes": total_bytes_moved,
-        "items": [asdict(i) for i in items]
+        "files": files_list,
+        # Claves adicionales para compatibilidad
+        "items": files_list
     }
 
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest_data, f, indent=2, ensure_ascii=False)
 
     return QuarantineResult(
+        session_id=session_id,
         quarantine_dir=quarantine_dir,
         manifest_path=manifest_path,
         total_moved=total_moved,
@@ -166,36 +191,101 @@ def quarantine_redundant_files(
         errors=errors
     )
 
+def find_quarantine_sessions(base_dir: Path | str) -> list[dict]:
+    """
+    Escaneo Local: Busca en base_dir todas las carpetas con el prefijo _quarantine_
+    y lee sus archivos manifest.json sin necesidad de calcular pesos en tiempo real.
+
+    Returns:
+        Lista de diccionarios ordenados por fecha descendente (más reciente primero).
+    """
+    target = Path(base_dir).resolve().absolute()
+    sessions = []
+
+    if not target.exists() or not target.is_dir():
+        return []
+
+    try:
+        for entry in target.iterdir():
+            if entry.is_dir() and entry.name.startswith("_quarantine_"):
+                manifest_file = entry / "manifest.json"
+                if manifest_file.exists():
+                    try:
+                        with open(manifest_file, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+
+                        ts = data.get("timestamp", "")
+                        if ts:
+                            date_display = ts.replace("T", " ")
+                        else:
+                            # Parsear timestamp desde el nombre de carpeta: _quarantine_YYYYMMDD_HHMMSS
+                            raw = entry.name.replace("_quarantine_", "")
+                            if len(raw) == 15 and "_" in raw:
+                                date_display = f"{raw[:4]}-{raw[4:6]}-{raw[6:8]} {raw[9:11]}:{raw[11:13]}:{raw[13:15]}"
+                            else:
+                                date_display = raw
+
+                        total_f = data.get("total_files", 0)
+                        total_b = data.get("total_bytes", 0)
+                        session_id = data.get("session_id", entry.name.lstrip("_"))
+
+                        sessions.append({
+                            "session_id": session_id,
+                            "folder_name": entry.name,
+                            "folder_path": entry,
+                            "manifest_path": manifest_file,
+                            "timestamp": date_display,
+                            "total_files": total_f,
+                            "total_bytes": total_b,
+                            "total_bytes_formatted": _format_bytes(total_b),
+                            "fully_restored": data.get("fully_restored", False)
+                        })
+                    except Exception:
+                        continue
+    except (PermissionError, OSError):
+        pass
+
+    # Ordenar por carpeta / fecha descendente
+    sessions.sort(key=lambda s: s["folder_name"], reverse=True)
+    return sessions
+
 def restore_from_quarantine(manifest_path: Path | str) -> RestoreResult:
     """
     Restaura automáticamente los archivos desde la cuarentena a sus ubicaciones originales
-    utilizando el archivo manifest.json codificado en UTF-8.
+    utilizando el archivo manifest.json. Si todos los archivos son restaurados con éxito,
+    elimina la carpeta de cuarentena vacía.
 
     Args:
         manifest_path: Ruta al archivo manifest.json generado durante la cuarentena.
 
     Returns:
-        RestoreResult con el balance de archivos restaurados.
+        RestoreResult con el balance de archivos restaurados y confirmación de eliminación.
     """
     manifest_p = Path(manifest_path).resolve().absolute()
     if not manifest_p.exists():
         raise FileNotFoundError(f"No se encontró el manifiesto de cuarentena: '{manifest_p}'")
 
+    quarantine_dir = manifest_p.parent
+
     with open(manifest_p, "r", encoding="utf-8") as f:
         manifest_data = json.load(f)
 
-    items_data = manifest_data.get("items", [])
+    # Soporte para ambas claves ("files" y "items")
+    files_data = manifest_data.get("files") or manifest_data.get("items") or []
     total_restored = 0
     total_bytes_restored = 0
     skipped_count = 0
     errors: list[str] = []
 
-    for item in items_data:
+    for item in files_data:
         if item.get("restored", False):
             skipped_count += 1
             continue
 
-        q_path = Path(item["quarantined_path"])
+        q_path_str = item.get("quarantine_path") or item.get("quarantined_path")
+        if not q_path_str:
+            continue
+        q_path = Path(q_path_str)
         orig_path = Path(item["original_path"])
 
         if not q_path.exists():
@@ -217,18 +307,31 @@ def restore_from_quarantine(manifest_path: Path | str) -> RestoreResult:
         except Exception as e:
             errors.append(f"Error restaurando '{q_path}' a '{orig_path}': {str(e)}")
 
-    # Guardar manifiesto actualizado en UTF-8
-    manifest_data["items"] = items_data
-    manifest_data["last_restored_at"] = datetime.now().isoformat()
-    manifest_data["fully_restored"] = all(it.get("restored", False) for it in items_data)
+    all_restored = all(it.get("restored", False) for it in files_data)
+    quarantine_folder_removed = False
 
-    with open(manifest_p, "w", encoding="utf-8") as f:
-        json.dump(manifest_data, f, indent=2, ensure_ascii=False)
+    if all_restored and len(errors) == 0:
+        # Fase 5: Eliminar la carpeta de cuarentena vacía si todo se restauró exitosamente
+        try:
+            manifest_p.unlink(missing_ok=True)
+            shutil.rmtree(quarantine_dir, ignore_errors=True)
+            quarantine_folder_removed = True
+        except Exception as e:
+            errors.append(f"No se pudo eliminar la carpeta de cuarentena vacía: {e}")
+    else:
+        # Actualizar manifiesto si quedaron archivos pendientes o con error
+        manifest_data["files"] = files_data
+        manifest_data["items"] = files_data
+        manifest_data["last_restored_at"] = datetime.now().isoformat()
+        manifest_data["fully_restored"] = all_restored
+        with open(manifest_p, "w", encoding="utf-8") as f:
+            json.dump(manifest_data, f, indent=2, ensure_ascii=False)
 
     return RestoreResult(
         manifest_path=manifest_p,
         total_restored=total_restored,
         total_bytes_restored=total_bytes_restored,
         skipped_count=skipped_count,
+        quarantine_folder_removed=quarantine_folder_removed,
         errors=errors
     )
