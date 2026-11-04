@@ -139,24 +139,24 @@ datacleaner restore "C:\MisDocumentos\_quarantine_20261104_154641\manifest.json"
 
 ---
 
-### 5.2 Modo Interfaz Gráfica Moderna (Desktop GUI con CustomTkinter)
+### 5.2 Modo Interfaz Gráfica (Desktop GUI con Sun Valley TTK - Fluent Design)
 
-Para iniciar la interfaz gráfica de usuario moderna:
+Para iniciar la interfaz gráfica de usuario con diseño Fluent Design Windows 11:
 ```bash
 datacleaner gui
 # o alternativamente:
 python main.py --gui
 ```
 
-**Características y Mejoras de Accesibilidad (A11y / WCAG):**
-- **Estilo Moderno Windows 11 con CustomTkinter:** Bordes redondeados, tipografía antialiasing e integración con temas de sistema.
-- **Selector de Tema Dinámico:** Conmutación instantánea entre **Modo Oscuro**, **Modo Claro** o **Automático (Sistema)**.
-- **Validación en Línea No Bloqueante:** Sustituye los mensajes de alerta emergentes por validación visual en tiempo real bajo el campo de texto (indicadores verde, amarillo y rojo), activando o desactivando el botón de escaneo automáticamente.
-- **Aislamiento de Tecnicismos:** El control de hilos de trabajo se calibra automáticamente según el hardware (`os.cpu_count()`) y se ubica junto a las reglas de permanencia dentro de un panel colapsable de *Opciones avanzadas*.
-- **Lenguaje Instruccional Directo:** Flujo guiado paso a paso para usuarios no técnicos: *"1. Seleccione una carpeta. 2. Escanee en busca de duplicados. Ningún archivo será borrado sin su confirmación"*.
-- **Dashboard de Métricas de Alto Contraste:** Tarjetas blancas/oscuras con números en negrita de alta legibilidad cumpliendo con las pautas de accesibilidad WCAG.
-- **Tabla de Datos Simplificada:** Hash SHA-256 ofuscado a 8 caracteres para eliminar ruido visual, priorizando Tamaño, Estado/Acción (`KEEP` en verde / `QUARANTINE` en naranja) y Ruta del Archivo.
-- **Call to Action (CTA) Destacado:** Botón principal de simulación destacado en azul sólido; botones secundarios dependientes del estado (Cuarentena, Restaurar, Exportar) con diseño delineado (*outline*).
+**Ventajas Arquitecturales y Mejoras de Accesibilidad (A11y / WCAG):**
+- **Arquitectura Zero-Class-Rewrite:** Utiliza las clases estándar de `tkinter.ttk` inyectando el tema moderno Sun Valley vía `sv-ttk`, asegurando compatibilidad nativa sin necesidad de reescribir la lógica de la vista ni romper dependencias.
+- **Fluent Design Windows 11:** Bordes redondeados sutiles, microinteracciones (hover/active) y botones de acción destacados con `Accent.TButton`.
+- **Gestión Centralizada de Tema:** Botón superior para alternar instantáneamente entre **Modo Oscuro** (`sun-valley-dark`) y **Modo Claro** (`sun-valley-light`).
+- **Validación en Línea No Bloqueante:** Sustituye ventanas emergentes por mensajes visuales directos en la tarjeta de selección, activando el botón de escaneo solo cuando la ruta es segura y válida.
+- **Aislamiento de Tecnicismos:** El conteo de hilos de trabajo se calibra automáticamente según el CPU (`os.cpu_count()`) y se ubica junto a las reglas de permanencia en el panel desplegable `⚙ Opciones avanzadas ▼`.
+- **Lenguaje Instruccional Directo:** Guía clara paso a paso: *"1. Seleccione una carpeta. 2. Escanee en busca de duplicados. Ningún archivo será borrado sin su confirmación"*.
+- **Dashboard de Alto Contraste:** Tarjetas estilo `Card.TFrame` con tipografía de alto peso visual (`font=("Segoe UI", 18, "bold")`) para cumplimiento de contraste WCAG.
+- **Tabla Simplificada de Duplicados:** Hash SHA-256 ofuscado a 8 caracteres (`c2aeccb6…`) para priorizar Grupo, Estado/Acción (`KEEP` / `QUARANTINE`), Tamaño y Ruta del Archivo.
 
 ---
 

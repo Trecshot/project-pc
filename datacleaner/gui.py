@@ -1,10 +1,12 @@
 """
-Interfaz Gráfica de Usuario de Escritorio Moderna (CustomTkinter Desktop GUI)
+Interfaz Gráfica de Usuario de Escritorio (Fluent Design con Sun Valley TTK)
 DataCleaner GUI
 
-Implementación moderna basada en CustomTkinter con diseño accesible (A11y),
-modo oscuro/claro nativo, bordes redondeados, validación en línea de rutas,
-aislamiento de tecnicismos y tarjetas de estadísticas de alto contraste (WCAG).
+Implementación bajo arquitectura Zero-Class-Rewrite sobre ttk estándar,
+inyectando el tema Sun Valley (Fluent Design Windows 11) mediante sv-ttk.
+Incluye soporte nativo de modo oscuro/claro, validación en línea de rutas,
+aislamiento de tecnicismos, tarjetas Card.TFrame de alto contraste (WCAG)
+y Call to Action con estilo Accent.TButton.
 """
 
 import os
@@ -12,9 +14,14 @@ import threading
 from pathlib import Path
 from typing import Any
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import ttk, filedialog, messagebox
+from tkinter.scrolledtext import ScrolledText
 
-import customtkinter as ctk
+try:
+    import sv_ttk
+    HAS_SV_TTK = True
+except ImportError:
+    HAS_SV_TTK = False
 
 from datacleaner.security import validate_target_path
 from datacleaner.scanner import scan_directory_for_duplicates, ScanSummary
@@ -33,11 +40,7 @@ from datacleaner.reporter import (
     export_report_json
 )
 
-# Configuración inicial de CustomTkinter
-ctk.set_appearance_mode("System")
-ctk.set_default_color_theme("blue")
-
-RULE_LABELS = {
+RULE_OPTIONS = {
     "Ruta más profunda y limpia, luego más reciente (Recomendado)": KeepRule.DEEPEST_THEN_NEWEST.value,
     "Ruta más profunda y limpia, luego más antigua": KeepRule.DEEPEST_THEN_OLDEST.value,
     "Ruta más superficial, luego más reciente": KeepRule.SHALLOWEST_THEN_NEWEST.value,
@@ -46,11 +49,15 @@ RULE_LABELS = {
 }
 
 class DataCleanerGUI:
-    def __init__(self, root: ctk.CTk, initial_dir: str | None = None):
+    def __init__(self, root: tk.Tk, initial_dir: str | None = None):
         self.root = root
         self.root.title("DataCleaner - Auditoría y Organización de Archivos")
-        self.root.geometry("1120x780")
-        self.root.minsize(880, 620)
+        self.root.geometry("1100x780")
+        self.root.minsize(860, 600)
+
+        # 1. Inyección de Tema Sun Valley (Fluent Design Windows 11)
+        self.current_theme = "dark"
+        self._apply_sun_valley_theme()
 
         # Estado del modelo
         self.current_base_dir: Path | None = None
@@ -60,353 +67,278 @@ class DataCleanerGUI:
         self.is_processing = False
         self.is_advanced_open = False
 
-        self._build_ui()
-        self._setup_treeview_styles()
+        # 2. Inicialización de componentes sobre ttk estándar (Zero-Class-Rewrite)
+        self._build_interface()
 
         if initial_dir:
             self.path_entry.insert(0, str(initial_dir))
             self._validate_path_input(str(initial_dir))
 
-    def _build_ui(self):
-        # Contenedor raíz con márgenes holgados (padx=20, pady=15)
-        self.main_container = ctk.CTkFrame(self.root, fg_color="transparent")
-        self.main_container.pack(fill="both", expand=True, padx=20, pady=15)
+    def _apply_sun_valley_theme(self):
+        """Aplica el tema Sun Valley o fallback a clam si no estuviese instalado."""
+        if HAS_SV_TTK:
+            try:
+                sv_ttk.set_theme(self.current_theme)
+            except Exception:
+                pass
+        else:
+            style = ttk.Style(self.root)
+            try:
+                style.theme_use("clam")
+            except Exception:
+                pass
 
-        # 1. Cabecera con lenguaje guiado directo y selector de tema
+        self._configure_custom_styles()
+
+    def _configure_custom_styles(self):
+        """Configuración de tipografías y colores de alto contraste WCAG."""
+        style = ttk.Style(self.root)
+
+        is_dark = (self.current_theme == "dark")
+
+        # Configuración de etiquetas y tarjetas
+        style.configure("HeaderTitle.TLabel", font=("Segoe UI", 18, "bold"))
+        style.configure("HeaderSubtitle.TLabel", font=("Segoe UI", 10))
+        style.configure("CardTitle.TLabel", font=("Segoe UI", 9, "bold"))
+        style.configure("CardValue.TLabel", font=("Segoe UI", 18, "bold"))
+        style.configure("AccentValue.TLabel", font=("Segoe UI", 18, "bold"))
+
+        # Configuración de Treeview con altura generosa
+        style.configure("Data.Treeview", rowheight=28, font=("Segoe UI", 9))
+        style.configure("Data.Treeview.Heading", font=("Segoe UI", 9, "bold"))
+
+    def _toggle_theme(self):
+        """Conmutación centralizada de tema oscuro / claro."""
+        self.current_theme = "light" if self.current_theme == "dark" else "dark"
+        if HAS_SV_TTK:
+            sv_ttk.set_theme(self.current_theme)
+        self._configure_custom_styles()
+        self._update_tag_colors()
+
+    def _build_interface(self):
+        # Contenedor principal con márgenes amplios (padx=20, pady=16)
+        self.main_frame = ttk.Frame(self.root, padding=(20, 16))
+        self.main_frame.pack(fill="both", expand=True)
+
+        # 1. Cabecera con lenguaje instruccional directo y botón de tema
         self._build_header()
 
         # 2. Panel de Selección y Validación en Línea
-        self._build_selection_panel()
+        self._build_selection_card()
 
-        # 3. Barra de Acciones y Call to Action (CTA)
+        # 3. Barra de Acciones con Call to Action (CTA) destacado
         self._build_action_bar()
 
-        # 4. Tarjetas de Estadísticas (Dashboard de Alto Contraste WCAG)
-        self._build_metrics_cards()
+        # 4. Tarjetas de Estadísticas (Dashboard WCAG)
+        self._build_dashboard_cards()
 
         # 5. Barra de Progreso y Estado Operativo
-        self._build_progress_bar()
+        self._build_progress_area()
 
-        # 6. Área de Resultados (Pestañas para Duplicados y Bitácora)
-        self._build_tabs_view()
+        # 6. Pestañas de Resultados (Duplicados y Bitácora)
+        self._build_notebook_tabs()
 
     def _build_header(self):
-        header_frame = ctk.CTkFrame(self.main_container, fg_color="transparent")
+        header_frame = ttk.Frame(self.main_frame)
         header_frame.pack(fill="x", pady=(0, 12))
 
-        # Textos informativos con lenguaje instruccional directo
-        info_subframe = ctk.CTkFrame(header_frame, fg_color="transparent")
-        info_subframe.pack(side="left", fill="x", expand=True)
+        text_frame = ttk.Frame(header_frame)
+        text_frame.pack(side="left", fill="x", expand=True)
 
-        title_lbl = ctk.CTkLabel(
-            info_subframe,
+        ttk.Label(
+            text_frame,
             text="DataCleaner",
-            font=ctk.CTkFont(family="Segoe UI", size=24, weight="bold")
-        )
-        title_lbl.pack(anchor="w")
+            style="HeaderTitle.TLabel"
+        ).pack(anchor="w")
 
-        # Lenguaje directo y claro para usuarios no técnicos
-        subtitle_lbl = ctk.CTkLabel(
-            info_subframe,
+        # Lenguaje guiado paso a paso para usuarios no técnicos
+        ttk.Label(
+            text_frame,
             text="1. Seleccione una carpeta.  2. Escanee en busca de duplicados.  Ningún archivo será borrado sin su confirmación.",
-            font=ctk.CTkFont(family="Segoe UI", size=13),
-            text_color=("gray35", "gray70")
+            style="HeaderSubtitle.TLabel"
+        ).pack(anchor="w", pady=(2, 0))
+
+        # Botón de alternancia de tema (Modo Claro / Oscuro)
+        theme_btn = ttk.Button(
+            header_frame,
+            text="🌓 Tema",
+            command=self._toggle_theme,
+            width=8
         )
-        subtitle_lbl.pack(anchor="w", pady=(2, 0))
+        theme_btn.pack(side="right", anchor="e")
 
-        # Selector de Tema (Modo Claro / Oscuro / Sistema)
-        theme_subframe = ctk.CTkFrame(header_frame, fg_color="transparent")
-        theme_subframe.pack(side="right", anchor="e")
+    def _build_selection_card(self):
+        # Panel contenedor estilo Card
+        self.card_selection = ttk.Frame(self.main_frame, style="Card.TFrame", padding=14)
+        self.card_selection.pack(fill="x", pady=(0, 12))
 
-        theme_lbl = ctk.CTkLabel(theme_subframe, text="Tema:", font=ctk.CTkFont(family="Segoe UI", size=12))
-        theme_lbl.pack(side="left", padx=(0, 6))
-
-        self.theme_menu = ctk.CTkOptionMenu(
-            theme_subframe,
-            values=["Sistema", "Oscuro", "Claro"],
-            command=self._change_theme,
-            width=100,
-            height=28,
-            corner_radius=6
-        )
-        self.theme_menu.set("Sistema")
-        self.theme_menu.pack(side="left")
-
-    def _build_selection_panel(self):
-        self.card_selection = ctk.CTkFrame(
-            self.main_container,
-            corner_radius=10,
-            fg_color=("white", "#23272d"),
-            border_width=1,
-            border_color=("gray85", "#30363d")
-        )
-        self.card_selection.pack(fill="x", pady=(0, 12), padx=0)
-
-        inner = ctk.CTkFrame(self.card_selection, fg_color="transparent")
-        inner.pack(fill="x", padx=16, pady=14)
-
-        # Fila 1: Campo de texto y botón examinar
-        row_browse = ctk.CTkFrame(inner, fg_color="transparent")
+        # Fila 1: Selección de carpeta
+        row_browse = ttk.Frame(self.card_selection)
         row_browse.pack(fill="x", pady=(0, 6))
 
-        ctk.CTkLabel(
+        ttk.Label(
             row_browse,
             text="Carpeta a auditar:",
-            font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold")
-        ).pack(side="left", padx=(0, 10))
+            font=("Segoe UI", 10, "bold")
+        ).pack(side="left", padx=(0, 8))
 
-        self.path_entry = ctk.CTkEntry(
-            row_browse,
-            placeholder_text="Haga clic en 'Examinar carpeta...' o ingrese la ruta del directorio",
-            font=ctk.CTkFont(family="Segoe UI", size=12),
-            height=36,
-            corner_radius=6
-        )
-        self.path_entry.pack(side="left", fill="x", expand=True, padx=(0, 10))
-        self.path_entry.bind("<KeyRelease>", lambda event: self._on_entry_key(event))
+        self.path_entry = ttk.Entry(row_browse, font=("Segoe UI", 10))
+        self.path_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.path_entry.bind("<KeyRelease>", self._on_path_key_release)
 
-        browse_btn = ctk.CTkButton(
+        browse_btn = ttk.Button(
             row_browse,
-            text="Examinar carpeta...",
+            text="Examinar...",
             command=self._browse_directory,
-            width=160,
-            height=36,
-            corner_radius=6,
-            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold")
+            width=14
         )
         browse_btn.pack(side="left")
 
         # Fila 2: Texto de validación en línea (Evita popups bloqueantes)
-        self.validation_label = ctk.CTkLabel(
-            inner,
+        self.validation_label = ttk.Label(
+            self.card_selection,
             text="Por favor seleccione una carpeta para comenzar.",
-            font=ctk.CTkFont(family="Segoe UI", size=12),
-            text_color=("gray50", "gray65"),
-            anchor="w"
+            font=("Segoe UI", 9)
         )
-        self.validation_label.pack(fill="x", pady=(0, 6))
+        self.validation_label.pack(anchor="w", pady=(0, 6))
 
-        # Fila 3: Toggle de Opciones Avanzadas (Aislamiento de tecnicismos)
-        row_adv_toggle = ctk.CTkFrame(inner, fg_color="transparent")
-        row_adv_toggle.pack(fill="x", pady=(2, 0))
-
-        self.adv_btn = ctk.CTkButton(
-            row_adv_toggle,
+        # Fila 3: Opciones Avanzadas Colapsables (Aislamiento de tecnicismos)
+        self.adv_btn = ttk.Button(
+            self.card_selection,
             text="⚙ Opciones avanzadas ▼",
             command=self._toggle_advanced_options,
-            fg_color="transparent",
-            hover_color=("gray90", "#2c313a"),
-            text_color=("gray30", "gray80"),
-            font=ctk.CTkFont(family="Segoe UI", size=12),
-            width=160,
-            height=26,
-            anchor="w"
+            width=22
         )
-        self.adv_btn.pack(side="left")
+        self.adv_btn.pack(anchor="w")
 
-        # Panel Colapsable de Opciones Avanzadas (Oculto por defecto)
-        self.advanced_frame = ctk.CTkFrame(
-            inner,
-            fg_color=("gray95", "#1c2128"),
-            corner_radius=8,
-            border_width=1,
-            border_color=("gray85", "#30363d")
-        )
+        # Panel colapsable interno
+        self.advanced_frame = ttk.Frame(self.card_selection, padding=(0, 8))
 
-        adv_content = ctk.CTkFrame(self.advanced_frame, fg_color="transparent")
-        adv_content.pack(fill="x", padx=12, pady=10)
+        row_adv = ttk.Frame(self.advanced_frame)
+        row_adv.pack(fill="x")
 
-        # Criterio de Conservación
-        ctk.CTkLabel(
-            adv_content,
+        ttk.Label(
+            row_adv,
             text="Criterio de Permanencia:",
-            font=ctk.CTkFont(family="Segoe UI", size=12, weight="bold")
-        ).pack(side="left", padx=(0, 8))
+            font=("Segoe UI", 9, "bold")
+        ).pack(side="left", padx=(0, 6))
 
-        self.rule_combobox = ctk.CTkOptionMenu(
-            adv_content,
-            values=list(RULE_LABELS.keys()),
-            width=380,
-            height=30,
-            corner_radius=6
+        self.rule_combobox = ttk.Combobox(
+            row_adv,
+            values=list(RULE_OPTIONS.keys()),
+            state="readonly",
+            width=48,
+            font=("Segoe UI", 9)
         )
-        self.rule_combobox.set("Ruta más profunda y limpia, luego más reciente (Recomendado)")
-        self.rule_combobox.pack(side="left", padx=(0, 20))
+        self.rule_combobox.current(0)
+        self.rule_combobox.pack(side="left", padx=(0, 16))
 
         # Hilos I/O automáticos
         default_workers = get_safe_worker_count()
-        ctk.CTkLabel(
-            adv_content,
-            text=f"Hilos de Trabajo (I/O): {default_workers} (Automático según CPU)",
-            font=ctk.CTkFont(family="Segoe UI", size=12),
-            text_color=("gray40", "gray70")
+        ttk.Label(
+            row_adv,
+            text=f"Hilos I/O: {default_workers} (Automático según CPU)",
+            font=("Segoe UI", 9)
         ).pack(side="left")
 
     def _build_action_bar(self):
-        action_bar = ctk.CTkFrame(self.main_container, fg_color="transparent")
+        action_bar = ttk.Frame(self.main_frame)
         action_bar.pack(fill="x", pady=(0, 12))
 
-        # CTA Principal: Destacado visualmente con color sólido
-        self.scan_btn = ctk.CTkButton(
+        # Call to Action (CTA) Principal: Estilo Accent.TButton destacado
+        self.scan_btn = ttk.Button(
             action_bar,
             text="🔍 Iniciar Simulación",
+            style="Accent.TButton",
             command=self._start_scan_thread,
-            fg_color="#2563EB",
-            hover_color="#1D4ED8",
-            font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
-            height=40,
-            corner_radius=8,
-            state="disabled"  # Inicia deshabilitado hasta tener ruta válida
+            state="disabled"  # Inicia deshabilitado hasta contar con carpeta válida
         )
-        self.scan_btn.pack(side="left", padx=(0, 10))
+        self.scan_btn.pack(side="left", padx=(0, 8))
 
-        # Botón Cuarentena: Estilo secundario delineado (outline) hasta que esté activo
-        self.quarantine_btn = ctk.CTkButton(
+        # Botón Cuarentena: Secundario hasta que el escaneo detecte duplicados
+        self.quarantine_btn = ttk.Button(
             action_bar,
             text="📦 Enviar a Cuarentena",
             command=self._execute_quarantine,
-            fg_color="transparent",
-            border_width=2,
-            border_color=("#EF4444", "#DC2626"),
-            text_color=("#DC2626", "#F87171"),
-            hover_color=("#FEE2E2", "#450A0A"),
-            font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"),
-            height=40,
-            corner_radius=8,
             state="disabled"
         )
-        self.quarantine_btn.pack(side="left", padx=(0, 10))
+        self.quarantine_btn.pack(side="left", padx=(0, 8))
 
-        # Botón Restaurar: Delineado secundario
-        self.restore_btn = ctk.CTkButton(
+        # Botón Restaurar: Secundario estándar
+        self.restore_btn = ttk.Button(
             action_bar,
             text="🔄 Restaurar desde Cuarentena",
-            command=self._restore_from_manifest,
-            fg_color="transparent",
-            border_width=1,
-            border_color=("gray75", "gray40"),
-            text_color=("gray20", "gray85"),
-            hover_color=("gray90", "gray25"),
-            font=ctk.CTkFont(family="Segoe UI", size=12),
-            height=40,
-            corner_radius=8
+            command=self._restore_from_manifest
         )
-        self.restore_btn.pack(side="left", padx=(0, 10))
+        self.restore_btn.pack(side="left", padx=(0, 8))
 
         # Botón Exportar JSON
-        self.export_btn = ctk.CTkButton(
+        self.export_btn = ttk.Button(
             action_bar,
             text="💾 Exportar JSON",
             command=self._export_json_report,
-            fg_color="transparent",
-            border_width=1,
-            border_color=("gray75", "gray40"),
-            text_color=("gray20", "gray85"),
-            hover_color=("gray90", "gray25"),
-            font=ctk.CTkFont(family="Segoe UI", size=12),
-            height=40,
-            corner_radius=8,
             state="disabled"
         )
         self.export_btn.pack(side="right")
 
-    def _build_metrics_cards(self):
-        metrics_container = ctk.CTkFrame(self.main_container, fg_color="transparent")
-        metrics_container.pack(fill="x", pady=(0, 12))
+    def _build_dashboard_cards(self):
+        cards_frame = ttk.Frame(self.main_frame)
+        cards_frame.pack(fill="x", pady=(0, 12))
 
-        # Tarjetas con estilo accesible y tipografía bold de alto contraste
-        self.card_files = self._create_metric_card(metrics_container, "Archivos Analizados", "0 (0 B)")
-        self.card_groups = self._create_metric_card(metrics_container, "Grupos Duplicados", "0")
-        self.card_redundant = self._create_metric_card(metrics_container, "Copias Redundantes", "0")
-        self.card_recoverable = self._create_metric_card(
-            metrics_container,
-            "Espacio Recuperable",
-            "0 B",
-            accent_color=("#059669", "#10B981")
-        )
+        self.card_files = self._create_card(cards_frame, "Archivos Analizados", "0 (0 B)")
+        self.card_groups = self._create_card(cards_frame, "Grupos Duplicados", "0")
+        self.card_redundant = self._create_card(cards_frame, "Copias Redundantes", "0")
+        self.card_recoverable = self._create_card(cards_frame, "Espacio Recuperable", "0 B", is_accent=True)
 
-    def _create_metric_card(
-        self,
-        parent: ctk.CTkFrame,
-        title: str,
-        initial_val: str,
-        accent_color: tuple[str, str] | None = None
-    ) -> ctk.CTkLabel:
-        card = ctk.CTkFrame(
-            parent,
-            corner_radius=10,
-            fg_color=("white", "#23272d"),
-            border_width=1,
-            border_color=("gray85", "#30363d")
-        )
+    def _create_card(self, parent: ttk.Frame, title: str, initial_val: str, is_accent: bool = False) -> ttk.Label:
+        card = ttk.Frame(parent, style="Card.TFrame", padding=(12, 10))
         card.pack(side="left", fill="both", expand=True, padx=4)
 
-        title_lbl = ctk.CTkLabel(
-            card,
-            text=title,
-            font=ctk.CTkFont(family="Segoe UI", size=11, weight="bold"),
-            text_color=("gray45", "gray65")
-        )
-        title_lbl.pack(anchor="center", pady=(10, 2))
-
-        val_color = accent_color or ("#1D4ED8", "#60A5FA")
-        val_lbl = ctk.CTkLabel(
+        ttk.Label(card, text=title, style="CardTitle.TLabel").pack(anchor="center")
+        val_lbl = ttk.Label(
             card,
             text=initial_val,
-            font=ctk.CTkFont(family="Segoe UI", size=19, weight="bold"),
-            text_color=val_color
+            style="AccentValue.TLabel" if is_accent else "CardValue.TLabel"
         )
-        val_lbl.pack(anchor="center", pady=(0, 12))
-
+        val_lbl.pack(anchor="center", pady=(4, 0))
         return val_lbl
 
-    def _build_progress_bar(self):
-        prog_frame = ctk.CTkFrame(self.main_container, fg_color="transparent")
+    def _build_progress_area(self):
+        prog_frame = ttk.Frame(self.main_frame)
         prog_frame.pack(fill="x", pady=(0, 10))
 
-        self.progress_bar = ctk.CTkProgressBar(
-            prog_frame,
-            height=8,
-            corner_radius=4,
-            progress_color="#2563EB"
-        )
-        self.progress_bar.set(0)
+        self.progress_bar = ttk.Progressbar(prog_frame, mode="determinate")
         self.progress_bar.pack(fill="x", pady=(0, 4))
 
-        self.status_label = ctk.CTkLabel(
+        self.status_label = ttk.Label(
             prog_frame,
-            text="Listo para auditar.",
-            font=ctk.CTkFont(family="Segoe UI", size=11),
-            text_color=("gray40", "gray70"),
-            anchor="w"
+            text="Listo para iniciar auditoría.",
+            font=("Segoe UI", 9)
         )
         self.status_label.pack(anchor="w")
 
-    def _build_tabs_view(self):
-        self.tabview = ctk.CTkTabview(
-            self.main_container,
-            corner_radius=10,
-            fg_color=("white", "#23272d"),
-            border_width=1,
-            border_color=("gray85", "#30363d")
-        )
-        self.tabview.pack(fill="both", expand=True)
+    def _build_notebook_tabs(self):
+        self.notebook = ttk.Notebook(self.main_frame)
+        self.notebook.pack(fill="both", expand=True)
 
-        tab_dups = self.tabview.add("Duplicados Encontrados")
-        tab_log = self.tabview.add("Bitácora de Registro")
+        tab_dups = ttk.Frame(self.notebook, padding=4)
+        tab_log = ttk.Frame(self.notebook, padding=4)
 
-        # Pestaña 1: Tabla simplificada de duplicados (ocultando el hash completo de 64 caracteres)
-        table_container = ctk.CTkFrame(tab_dups, fg_color="transparent")
-        table_container.pack(fill="both", expand=True, padx=4, pady=4)
+        self.notebook.add(tab_dups, text=" Duplicados Encontrados ")
+        self.notebook.add(tab_log, text=" Bitácora de Registro ")
 
-        # Dimensiones priorizadas: Grupo, Estado, Tamaño, Hash (8 chars), Ruta
+        # Pestaña 1: Tabla simplificada de datos (sin ruido de hash de 64 caracteres)
+        table_container = ttk.Frame(tab_dups)
+        table_container.pack(fill="both", expand=True)
+
+        # Dimensiones priorizadas: Grupo, Acción, Tamaño, Hash (8 car.), Ruta
         columns = ("group", "action", "size", "hash_short", "path")
         self.tree = ttk.Treeview(
             table_container,
             columns=columns,
             show="headings",
             selectmode="browse",
-            style="Modern.Treeview"
+            style="Data.Treeview"
         )
 
         self.tree.heading("group", text="Grupo")
@@ -415,87 +347,42 @@ class DataCleanerGUI:
         self.tree.heading("hash_short", text="Hash (8 car.)")
         self.tree.heading("path", text="Ruta del Archivo")
 
-        self.tree.column("group", width=70, anchor="center")
+        self.tree.column("group", width=65, anchor="center")
         self.tree.column("action", width=140, anchor="center")
         self.tree.column("size", width=100, anchor="e")
-        self.tree.column("hash_short", width=110, anchor="center")
+        self.tree.column("hash_short", width=105, anchor="center")
         self.tree.column("path", width=580, anchor="w")
 
-        tree_scroll_y = ttk.Scrollbar(table_container, orient="vertical", command=self.tree.yview)
-        tree_scroll_x = ttk.Scrollbar(table_container, orient="horizontal", command=self.tree.xview)
-        self.tree.configure(yscrollcommand=tree_scroll_y.set, xscrollcommand=tree_scroll_x.set)
+        scroll_y = ttk.Scrollbar(table_container, orient="vertical", command=self.tree.yview)
+        scroll_x = ttk.Scrollbar(table_container, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
 
-        tree_scroll_y.pack(side="right", fill="y")
-        tree_scroll_x.pack(side="bottom", fill="x")
+        scroll_y.pack(side="right", fill="y")
+        scroll_x.pack(side="bottom", fill="x")
         self.tree.pack(side="left", fill="both", expand=True)
 
+        self._update_tag_colors()
+
         # Pestaña 2: Bitácora de Registro
-        self.log_textbox = ctk.CTkTextbox(
+        self.log_text = ScrolledText(
             tab_log,
-            font=ctk.CTkFont(family="Consolas", size=12),
-            corner_radius=8,
-            wrap="word"
+            wrap="word",
+            font=("Consolas", 9),
+            padx=8,
+            pady=8
         )
-        self.log_textbox.pack(fill="both", expand=True, padx=4, pady=4)
+        self.log_text.pack(fill="both", expand=True)
 
-    def _setup_treeview_styles(self):
-        """Aplica estilos visuales modernos a la tabla ttk acordes con el tema actual."""
-        style = ttk.Style()
-        try:
-            style.theme_use("clam")
-        except Exception:
-            pass
-
-        is_dark = ctk.get_appearance_mode().lower() == "dark"
-
-        bg_color = "#1c2128" if is_dark else "#ffffff"
-        fg_color = "#f0f6fc" if is_dark else "#1f2937"
-        heading_bg = "#2d333b" if is_dark else "#f3f4f6"
-        heading_fg = "#c9d1d9" if is_dark else "#111827"
-        selected_bg = "#1f6aa5" if is_dark else "#bfdbfe"
-        selected_fg = "#ffffff" if is_dark else "#1e3a8a"
-
-        style.configure(
-            "Modern.Treeview",
-            background=bg_color,
-            fieldbackground=bg_color,
-            foreground=fg_color,
-            rowheight=30,
-            font=("Segoe UI", 10),
-            borderwidth=0
-        )
-        style.configure(
-            "Modern.Treeview.Heading",
-            background=heading_bg,
-            foreground=heading_fg,
-            font=("Segoe UI", 10, "bold"),
-            relief="flat",
-            padding=(6, 6)
-        )
-        style.map(
-            "Modern.Treeview",
-            background=[("selected", selected_bg)],
-            foreground=[("selected", selected_fg)]
-        )
-
-        # Etiquetas de estado para filas
-        keep_bg = "#064e3b" if is_dark else "#d1fae5"
+    def _update_tag_colors(self):
+        """Asigna colores de fila según el tema oscuro o claro."""
+        is_dark = (self.current_theme == "dark")
+        keep_bg = "#0f392b" if is_dark else "#d1fae5"
         keep_fg = "#a7f3d0" if is_dark else "#065f46"
-        quar_bg = "#78350f" if is_dark else "#fef3c7"
+        quar_bg = "#451a03" if is_dark else "#fef3c7"
         quar_fg = "#fde68a" if is_dark else "#92400e"
 
         self.tree.tag_configure("keep", background=keep_bg, foreground=keep_fg)
         self.tree.tag_configure("quarantine", background=quar_bg, foreground=quar_fg)
-
-    def _change_theme(self, mode: str):
-        if mode == "Sistema":
-            ctk.set_appearance_mode("System")
-        elif mode == "Oscuro":
-            ctk.set_appearance_mode("Dark")
-        elif mode == "Claro":
-            ctk.set_appearance_mode("Light")
-
-        self.root.after(100, self._setup_treeview_styles)
 
     def _toggle_advanced_options(self):
         if self.is_advanced_open:
@@ -503,11 +390,11 @@ class DataCleanerGUI:
             self.adv_btn.configure(text="⚙ Opciones avanzadas ▼")
             self.is_advanced_open = False
         else:
-            self.advanced_frame.pack(fill="x", pady=(8, 0))
+            self.advanced_frame.pack(fill="x", pady=(6, 0))
             self.adv_btn.configure(text="⚙ Opciones avanzadas ▲")
             self.is_advanced_open = True
 
-    def _on_entry_key(self, event):
+    def _on_path_key_release(self, event):
         path_str = self.path_entry.get().strip()
         self._validate_path_input(path_str)
 
@@ -525,8 +412,7 @@ class DataCleanerGUI:
         """
         if not path_str:
             self.validation_label.configure(
-                text="Por favor seleccione una carpeta para comenzar.",
-                text_color=("gray50", "gray65")
+                text="Por favor seleccione una carpeta para comenzar."
             )
             self.scan_btn.configure(state="disabled")
             self.current_base_dir = None
@@ -535,40 +421,36 @@ class DataCleanerGUI:
         try:
             validated = validate_target_path(path_str)
             self.validation_label.configure(
-                text=f"✔ Carpeta válida y segura para auditar: {validated}",
-                text_color=("#059669", "#10B981")
+                text=f"✔ Carpeta válida y segura para auditar: {validated}"
             )
             self.scan_btn.configure(state="normal")
             self.current_base_dir = validated
             return True
         except PermissionError as pe:
             self.validation_label.configure(
-                text=f"⛔ Protegido por el sistema: {pe}",
-                text_color=("#DC2626", "#EF4444")
+                text=f"⛔ Protegido por el sistema: {pe}"
             )
             self.scan_btn.configure(state="disabled")
             self.current_base_dir = None
             return False
         except FileNotFoundError:
             self.validation_label.configure(
-                text="⚠ La carpeta especificada no existe en el almacenamiento.",
-                text_color=("#D97706", "#F59E0B")
+                text="⚠ La carpeta especificada no existe en el almacenamiento."
             )
             self.scan_btn.configure(state="disabled")
             self.current_base_dir = None
             return False
         except Exception as e:
             self.validation_label.configure(
-                text=f"⚠ Ruta no válida: {e}",
-                text_color=("#DC2626", "#EF4444")
+                text=f"⚠ Ruta no válida: {e}"
             )
             self.scan_btn.configure(state="disabled")
             self.current_base_dir = None
             return False
 
     def _log(self, text: str):
-        self.log_textbox.insert(tk.END, f"{text}\n")
-        self.log_textbox.see(tk.END)
+        self.log_text.insert(tk.END, f"{text}\n")
+        self.log_text.see(tk.END)
 
     def _start_scan_thread(self):
         if self.is_processing or not self.current_base_dir:
@@ -576,14 +458,14 @@ class DataCleanerGUI:
 
         target_dir = self.current_base_dir
         rule_key = self.rule_combobox.get()
-        keep_rule = RULE_LABELS.get(rule_key, KeepRule.DEEPEST_THEN_NEWEST.value)
+        keep_rule = RULE_OPTIONS.get(rule_key, KeepRule.DEEPEST_THEN_NEWEST.value)
         workers = get_safe_worker_count()
 
         self.is_processing = True
         self.scan_btn.configure(state="disabled")
         self.quarantine_btn.configure(state="disabled")
         self.export_btn.configure(state="disabled")
-        self.progress_bar.set(0)
+        self.progress_bar["value"] = 0
         self.status_label.configure(text="Iniciando escaneo y análisis por tamaño...")
 
         # Limpiar tabla
@@ -595,7 +477,7 @@ class DataCleanerGUI:
 
         def worker():
             def progress_cb(done, total, fname):
-                pct = (done / total) if total > 0 else 0
+                pct = int((done / total) * 100) if total > 0 else 0
                 self.root.after(0, lambda: self._update_progress(pct, f"Calculando SHA-256 ({done}/{total}): {fname}"))
 
             duplicates, summary = scan_directory_for_duplicates(
@@ -615,9 +497,9 @@ class DataCleanerGUI:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _update_progress(self, ratio: float, status_text: str):
-        self.progress_bar.set(ratio)
-        self.status_label.configure(text=status_text)
+    def _update_progress(self, percent: int, text: str):
+        self.progress_bar["value"] = percent
+        self.status_label.configure(text=text)
 
     def _on_scan_completed(self, duplicates: dict, summary: ScanSummary, report: dict):
         self.is_processing = False
@@ -655,18 +537,14 @@ class DataCleanerGUI:
                 )
 
         if meta["total_redundant_files"] > 0:
-            # Activar botón de cuarentena con realce visual
-            self.quarantine_btn.configure(
-                state="normal",
-                fg_color="#DC2626",
-                text_color="#FFFFFF",
-                hover_color="#B91C1C"
-            )
+            # Activar botón de cuarentena
+            self.quarantine_btn.configure(state="normal", style="Accent.TButton")
             self.status_label.configure(
                 text=f"Simulación completa: {meta['total_redundant_files']} archivos redundantes detectados. "
                      f"Espacio recuperable: {meta['recoverable_formatted']}."
             )
         else:
+            self.quarantine_btn.configure(style="TButton")
             self.status_label.configure(
                 text="Auditoría completa: No se encontraron archivos duplicados. El almacenamiento está limpio."
             )
@@ -695,7 +573,7 @@ class DataCleanerGUI:
             return
 
         rule_key = self.rule_combobox.get()
-        keep_rule = RULE_LABELS.get(rule_key, KeepRule.DEEPEST_THEN_NEWEST.value)
+        keep_rule = RULE_OPTIONS.get(rule_key, KeepRule.DEEPEST_THEN_NEWEST.value)
         plan = build_audit_plan(self.last_duplicates, keep_rule=keep_rule)
 
         try:
@@ -709,7 +587,7 @@ class DataCleanerGUI:
                 f"Ubicación:\n{res.quarantine_dir}\n\n"
                 f"Puede restaurarlos en cualquier momento utilizando el botón 'Restaurar desde Cuarentena'."
             )
-            # Re-escanear para actualizar vista
+            self.quarantine_btn.configure(state="disabled", style="TButton")
             self._start_scan_thread()
         except Exception as e:
             messagebox.showerror("Error en Cuarentena", f"Ocurrió un error al mover los archivos: {e}")
@@ -756,7 +634,7 @@ class DataCleanerGUI:
             messagebox.showinfo("Exportación Exitosa", f"El reporte fue guardado correctamente en:\n{save_path}")
 
 def launch_gui(initial_dir: str | None = None):
-    root = ctk.CTk()
+    root = tk.Tk()
     app = DataCleanerGUI(root, initial_dir=initial_dir)
     root.mainloop()
 

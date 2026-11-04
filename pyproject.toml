@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "rich>=13.0.0",
-    "customtkinter>=6.0.0"
+    "sv-ttk>=2.6.0"
 ]
 
 [project.scripts]
