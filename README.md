@@ -20,7 +20,7 @@ El software sigue un patrón modular desacoplado en capas:
 ```
 ┌────────────────────────────────────────────────────────┐
 │               Capa de Interfaz de Usuario              │
-│                 (CLI con Rich / GUI Tkinter)           │
+│            (CLI con Rich / GUI CustomTkinter)          │
 └──────────────────────────┬─────────────────────────────┘
                            │
                            ▼
@@ -139,24 +139,24 @@ datacleaner restore "C:\MisDocumentos\_quarantine_20261104_154641\manifest.json"
 
 ---
 
-### 5.2 Modo Interfaz Gráfica (Desktop GUI)
+### 5.2 Modo Interfaz Gráfica Moderna (Desktop GUI con CustomTkinter)
 
-Para iniciar la interfaz gráfica de usuario:
+Para iniciar la interfaz gráfica de usuario moderna:
 ```bash
 datacleaner gui
 # o alternativamente:
 python main.py --gui
 ```
 
-**Características de la GUI:**
-- **Selector de Carpetas Seguro:** Valida en tiempo real que el directorio elegido no sea una partición raíz ni pertenezca al sistema operativo.
-- **Selector de Regla de Permanencia:** Combobox con descripciones claras en lenguaje natural.
-- **Selector de Hilos I/O:** Configuración dinámica del ThreadPoolExecutor (1 a 16 hilos).
-- **Dashboard de Métricas:** Tarjetas visuales con total de archivos analizados, grupos detectados, copias redundantes y espacio exacto recuperable.
-- **Tabla Treeview Interactiva:** Visualiza con etiquetas de color (`KEEP` en verde, `QUARANTINE` en naranja) los archivos a conservar y las rutas duplicadas.
-- **Ejecución de Cuarentena con Alerta de Confirmación:** Diálogo modal informativo antes de cualquier traslado físico.
-- **Restaurador Integrado:** Botón para seleccionar cualquier archivo `manifest.json` y revertir la operación con un solo clic.
-- **Exportador a JSON:** Guarda el reporte de auditoría completo en disco.
+**Características y Mejoras de Accesibilidad (A11y / WCAG):**
+- **Estilo Moderno Windows 11 con CustomTkinter:** Bordes redondeados, tipografía antialiasing e integración con temas de sistema.
+- **Selector de Tema Dinámico:** Conmutación instantánea entre **Modo Oscuro**, **Modo Claro** o **Automático (Sistema)**.
+- **Validación en Línea No Bloqueante:** Sustituye los mensajes de alerta emergentes por validación visual en tiempo real bajo el campo de texto (indicadores verde, amarillo y rojo), activando o desactivando el botón de escaneo automáticamente.
+- **Aislamiento de Tecnicismos:** El control de hilos de trabajo se calibra automáticamente según el hardware (`os.cpu_count()`) y se ubica junto a las reglas de permanencia dentro de un panel colapsable de *Opciones avanzadas*.
+- **Lenguaje Instruccional Directo:** Flujo guiado paso a paso para usuarios no técnicos: *"1. Seleccione una carpeta. 2. Escanee en busca de duplicados. Ningún archivo será borrado sin su confirmación"*.
+- **Dashboard de Métricas de Alto Contraste:** Tarjetas blancas/oscuras con números en negrita de alta legibilidad cumpliendo con las pautas de accesibilidad WCAG.
+- **Tabla de Datos Simplificada:** Hash SHA-256 ofuscado a 8 caracteres para eliminar ruido visual, priorizando Tamaño, Estado/Acción (`KEEP` en verde / `QUARANTINE` en naranja) y Ruta del Archivo.
+- **Call to Action (CTA) Destacado:** Botón principal de simulación destacado en azul sólido; botones secundarios dependientes del estado (Cuarentena, Restaurar, Exportar) con diseño delineado (*outline*).
 
 ---
 
