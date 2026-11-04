@@ -1,9 +1,11 @@
 """
-Subsistema de Cuarentena y Restauración Automatizada (Soft-Delete & Restore)
+Subsistema de Cuarentena y Restauración Automatizada (Hardened Soft-Delete & Restore)
 DataCleaner CLI/GUI
 
-Traslada archivos redundantes a un directorio aislado preservando su árbol relativo
-y generando un manifiesto JSON reversible para restauración inmediata (RF-06 y Sección 7).
+Traslada archivos redundantes a un directorio aislado preservando su árbol relativo,
+incorporando resolución de colisiones de nombres mediante sufijos de unicidad (Zero Overwrite)
+y persistencia reversible mediante manifest.json codificado estrictamente en UTF-8.
+Cumple con RF-06 y las directrices de hardening.
 """
 
 from pathlib import Path
@@ -49,7 +51,7 @@ def create_quarantine_directory(base_dir: Path, custom_parent: Path | None = Non
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     folder_name = f"_quarantine_{timestamp}"
     parent = custom_parent if custom_parent else base_dir
-    quarantine_dir = (parent / folder_name).resolve()
+    quarantine_dir = (parent / folder_name).resolve().absolute()
     quarantine_dir.mkdir(parents=True, exist_ok=True)
     return quarantine_dir
 
@@ -60,12 +62,16 @@ def quarantine_redundant_files(
 ) -> QuarantineResult:
     """
     Ejecuta el traslado no destructivo (soft-delete) de los archivos redundantemente detectados.
+    
+    Hardening:
+    - Réplica exacta de la jerarquía relativa de carpetas.
+    - Resolución de colisiones si el archivo de destino ya existiera (añade sufijo de hash y contador).
+    - Serialización de metadatos estrictamente en UTF-8 para soporte de acentos y caracteres especiales.
 
     Args:
         base_dir: Directorio base auditado.
-        quarantine_plan: Lista de diccionarios con formato:
-                         [{"hash": sha, "keep": Path, "quarantine": [Path, ...], "size": bytes}]
-        custom_quarantine_dir: Carpeta personalizada de destino o None para generar una en base_dir.
+        quarantine_plan: Lista con formato [{"hash": sha, "keep": Path, "quarantine": [Path, ...]}]
+        custom_quarantine_dir: Carpeta personalizada opcional de destino.
 
     Returns:
         QuarantineResult con detalles de la operación y el archivo manifest.json generado.
@@ -83,7 +89,7 @@ def quarantine_redundant_files(
         redundant_paths: list[Path] = group.get("quarantine", [])
 
         for orig_file in redundant_paths:
-            orig_path = Path(orig_file).resolve()
+            orig_path = Path(orig_file).resolve().absolute()
             if not orig_path.exists():
                 errors.append(f"Archivo original no encontrado para cuarentena: {orig_path}")
                 continue
@@ -91,14 +97,27 @@ def quarantine_redundant_files(
             try:
                 # Calcular ruta relativa respecto al base_dir
                 try:
-                    rel_path = orig_path.relative_to(base_dir)
+                    rel_path = orig_path.relative_to(base_dir.resolve().absolute())
                 except ValueError:
-                    # En caso de estar en una raíz diferente, se replica la ruta sin los dos puntos
+                    # En caso de estar en una raíz diferente, se replica la ruta normalizada
                     rel_path = Path(str(orig_path).replace(":", ""))
                     if rel_path.is_absolute():
                         rel_path = rel_path.relative_to(rel_path.anchor)
 
-                dest_file = quarantine_dir / rel_path
+                dest_file = (quarantine_dir / rel_path).resolve().absolute()
+
+                # Prevención estricta de colisiones (Zero Overwrite):
+                # Si dest_file ya existiese, añadir sufijo para nunca sobrescribir
+                if dest_file.exists():
+                    parent_dir = dest_file.parent
+                    stem = dest_file.stem
+                    suffix = dest_file.suffix
+                    short_hash = file_hash[:8] if file_hash else "dup"
+                    counter = 1
+                    while dest_file.exists():
+                        dest_file = parent_dir / f"{stem}_{short_hash}_{counter}{suffix}"
+                        counter += 1
+
                 dest_file.parent.mkdir(parents=True, exist_ok=True)
 
                 stat = orig_path.stat()
@@ -124,12 +143,12 @@ def quarantine_redundant_files(
             except Exception as e:
                 errors.append(f"Error moviendo '{orig_path}' a cuarentena: {str(e)}")
 
-    # Guardar manifiesto de estado en formato JSON
+    # Guardar manifiesto de estado en formato JSON con codificación UTF-8 estricta
     manifest_data = {
         "format_version": "1.0",
         "timestamp": datetime.now().isoformat(),
-        "base_dir": str(base_dir.resolve()),
-        "quarantine_dir": str(quarantine_dir.resolve()),
+        "base_dir": str(base_dir.resolve().absolute()),
+        "quarantine_dir": str(quarantine_dir.resolve().absolute()),
         "total_files": total_moved,
         "total_bytes": total_bytes_moved,
         "items": [asdict(i) for i in items]
@@ -150,7 +169,7 @@ def quarantine_redundant_files(
 def restore_from_quarantine(manifest_path: Path | str) -> RestoreResult:
     """
     Restaura automáticamente los archivos desde la cuarentena a sus ubicaciones originales
-    utilizando el archivo manifest.json.
+    utilizando el archivo manifest.json codificado en UTF-8.
 
     Args:
         manifest_path: Ruta al archivo manifest.json generado durante la cuarentena.
@@ -158,7 +177,7 @@ def restore_from_quarantine(manifest_path: Path | str) -> RestoreResult:
     Returns:
         RestoreResult con el balance de archivos restaurados.
     """
-    manifest_p = Path(manifest_path).resolve()
+    manifest_p = Path(manifest_path).resolve().absolute()
     if not manifest_p.exists():
         raise FileNotFoundError(f"No se encontró el manifiesto de cuarentena: '{manifest_p}'")
 
@@ -198,7 +217,7 @@ def restore_from_quarantine(manifest_path: Path | str) -> RestoreResult:
         except Exception as e:
             errors.append(f"Error restaurando '{q_path}' a '{orig_path}': {str(e)}")
 
-    # Guardar manifiesto actualizado
+    # Guardar manifiesto actualizado en UTF-8
     manifest_data["items"] = items_data
     manifest_data["last_restored_at"] = datetime.now().isoformat()
     manifest_data["fully_restored"] = all(it.get("restored", False) for it in items_data)

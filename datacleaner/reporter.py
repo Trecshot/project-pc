@@ -77,7 +77,9 @@ def generate_report_dict(
             "total_redundant_files": total_quarantine_files,
             "recoverable_bytes": total_recoverable_bytes,
             "recoverable_formatted": format_bytes(total_recoverable_bytes),
-            "unreadable_files": summary.unreadable_files_count
+            "unreadable_files": summary.unreadable_files_count,
+            "warnings_count": len(summary.warnings),
+            "warnings": summary.warnings
         },
         "groups": [
             {
@@ -164,6 +166,14 @@ def print_rich_report(report_data: dict[str, Any], console=None):
         f"\n[bold]Espacio recuperable estimado:[/bold] [bold green]{meta['recoverable_formatted']}[/bold green] "
         f"([cyan]{meta['total_redundant_files']}[/cyan] archivos a cuarentena).\n"
     )
+
+    if meta.get("warnings"):
+        console.print(f"[bold yellow]Advertencias del sistema ({len(meta['warnings'])}):[/bold yellow]")
+        for w in meta["warnings"][:5]:
+            console.print(f"  [dim]- {w}[/dim]")
+        if len(meta["warnings"]) > 5:
+            console.print(f"  [dim]... y {len(meta['warnings']) - 5} advertencias más.[/dim]")
+        console.print()
 
 def _print_plain_report(report_data: dict[str, Any]):
     """Impresión estándar de texto plano sin dependencias externas."""
