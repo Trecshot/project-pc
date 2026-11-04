@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "datacleaner"
+version = "1.0.0"
+description = "Gestor Local de Organización y Auditoría de Archivos por Hash (DataCleaner CLI/GUI)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "rich>=13.0.0"
+]
+
+[project.scripts]
+datacleaner = "datacleaner.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["datacleaner*"]
