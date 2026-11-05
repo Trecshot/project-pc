@@ -23,12 +23,6 @@ try:
 except ImportError:
     HAS_AIOFILES = False
 
-try:
-    import xxhash
-    HAS_XXHASH = True
-except ImportError:
-    HAS_XXHASH = False
-
 DEFAULT_CHUNK_SIZE = 65536  # 64 KB por bloque según especificación RF-03 y Fase 2 Multi-Stage
 MIN_WORKERS = 1
 MAX_SAFE_WORKERS = 8  # Límite superior seguro para evitar agotamiento de descriptores de archivo
@@ -46,17 +40,6 @@ def get_safe_worker_count(requested_workers: int | None = None) -> int:
     if requested_workers <= 0:
         return MIN_WORKERS
     return max(MIN_WORKERS, min(requested_workers, 16))
-
-
-def _new_fast_hasher():
-    """
-    Retorna un motor de hash ultrarrápido no criptográfico (xxHash64 si está instalado)
-    o BLAKE2b de 128 bits (implementado en C nativo en la librería estándar de Python,
-    significativamente más veloz que SHA-256 para descarte de bordes O(k)).
-    """
-    if HAS_XXHASH:
-        return xxhash.xxh64()
-    return hashlib.blake2b(digest_size=16)
 
 
 def compute_partial_hash(

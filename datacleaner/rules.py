@@ -10,6 +10,7 @@ de ruta y fecha de modificación. Cumple con la Sección 7 de la especificación
 from pathlib import Path
 from enum import Enum
 import os
+import re
 
 class KeepRule(str, Enum):
     DEEPEST_THEN_NEWEST = "deepest_then_newest"
@@ -24,22 +25,33 @@ SUSPICIOUS_PATH_KEYWORDS = {
     "cache", "copia", "copy", "bak", "backup", "descartes"
 }
 
-def calculate_path_cleanliness_score(path: Path) -> int:
+def calculate_path_cleanliness_score(path: Path, base_dir: Path | None = None) -> int:
     """
     Asigna un puntaje de idoneidad según la estructura de la ruta.
     Rutas estructuradas en carpetas de proyectos reciben mejor puntaje que
     rutas temporales o de descargas.
+    Utiliza tokenización delimitada por espacios, guiones o puntos para evitar falsos
+    positivos con palabras como 'Templates', 'Temporada_1', 'Copyright' o 'Microscopio'.
     """
     score = 0
-    parts_lower = [p.lower() for p in path.parts]
+    resolved_path = path.resolve()
+    if base_dir:
+        try:
+            rel_path = resolved_path.relative_to(Path(base_dir).resolve())
+            parts_to_evaluate = rel_path.parts
+        except ValueError:
+            parts_to_evaluate = resolved_path.parts
+    else:
+        parts_to_evaluate = resolved_path.parts
 
-    # Penalizar si contiene carpetas provisionales
-    for part in parts_lower:
-        if any(keyword in part for keyword in SUSPICIOUS_PATH_KEYWORDS):
+    # Penalizar si contiene componentes o tokens provisionales
+    for part in parts_to_evaluate:
+        tokens = set(re.split(r'[\s_\-\.]+', part.lower()))
+        if any(keyword in tokens for keyword in SUSPICIOUS_PATH_KEYWORDS):
             score -= 100
 
     # Favorecer rutas con profundidad organizativa (más niveles de subdirectorios)
-    score += len(path.parts) * 10
+    score += len(parts_to_evaluate) * 10
     return score
 
 def get_file_mtime(path: Path) -> float:
@@ -49,7 +61,11 @@ def get_file_mtime(path: Path) -> float:
     except (OSError, PermissionError):
         return 0.0
 
-def select_file_to_keep(paths: list[Path], rule: KeepRule | str = KeepRule.DEEPEST_THEN_NEWEST) -> tuple[Path, list[Path]]:
+def select_file_to_keep(
+    paths: list[Path],
+    rule: KeepRule | str = KeepRule.DEEPEST_THEN_NEWEST,
+    base_dir: Path | None = None
+) -> tuple[Path, list[Path]]:
     """
     Selecciona el archivo superviviente y los archivos a aislar en cuarentena
     según la regla especificada.
@@ -57,6 +73,7 @@ def select_file_to_keep(paths: list[Path], rule: KeepRule | str = KeepRule.DEEPE
     Args:
         paths: Lista de rutas con contenido binario idéntico.
         rule: Regla de selección (KeepRule o string coincidente).
+        base_dir: Directorio base opcional para calcular rutas relativas limpias.
 
     Returns:
         Tupla: (archivo_a_conservar, lista_archivos_a_cuarentena)
@@ -74,7 +91,7 @@ def select_file_to_keep(paths: list[Path], rule: KeepRule | str = KeepRule.DEEPE
 
     def sort_key(p: Path):
         mtime = get_file_mtime(p)
-        clean_score = calculate_path_cleanliness_score(p)
+        clean_score = calculate_path_cleanliness_score(p, base_dir=base_dir)
         depth = len(p.parts)
 
         if rule == KeepRule.DEEPEST_THEN_NEWEST:

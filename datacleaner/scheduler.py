@@ -55,11 +55,12 @@ def build_schtasks_create_command(
     if freq not in ("DAILY", "WEEKLY", "MONTHLY"):
         raise ValueError(f"Frecuencia no soportada: {schedule_type}. Use DAILY, WEEKLY o MONTHLY.")
 
-    main_script = (Path(__file__).resolve().parent.parent / "main.py").resolve()
-    py_bin = _resolve_background_python()
-
-    # Comando que ejecutará el Programador de Tareas de Windows en modo desatendido (--yes)
-    task_action = f'"{py_bin}" "{main_script}" quarantine "{validated_dir}" --keep-rule {keep_rule} --yes'
+    if "__compiled__" in globals() or getattr(sys, "frozen", False):
+        task_action = f'"{sys.executable}" quarantine "{validated_dir}" --keep-rule {keep_rule} --yes'
+    else:
+        main_script = (Path(__file__).resolve().parent.parent / "main.py").resolve()
+        py_bin = _resolve_background_python()
+        task_action = f'"{py_bin}" "{main_script}" quarantine "{validated_dir}" --keep-rule {keep_rule} --yes'
 
     return [
         "schtasks",

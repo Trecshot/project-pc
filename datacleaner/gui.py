@@ -1426,7 +1426,25 @@ class DataCleanerGUI:
         """
         Renderiza mediante matplotlib embebido en Tkinter (FigureCanvasTkAgg)
         la tendencia histórica de memoria recuperada consultada desde SQLite.
+        Libera figuras y canvas previos para evitar fugas de memoria GDI / RAM.
         """
+        if hasattr(self, "_mpl_fig") and self._mpl_fig is not None:
+            try:
+                self._mpl_fig.clf()
+                if HAS_MATPLOTLIB:
+                    import matplotlib.pyplot as plt
+                    plt.close(self._mpl_fig)
+            except Exception:
+                pass
+            self._mpl_fig = None
+
+        if hasattr(self, "_mpl_canvas") and self._mpl_canvas is not None:
+            try:
+                self._mpl_canvas.get_tk_widget().destroy()
+            except Exception:
+                pass
+            self._mpl_canvas = None
+
         for child in self.chart_frame.winfo_children():
             child.destroy()
 
@@ -2038,9 +2056,10 @@ class DataCleanerGUI:
         rec_str = self.last_report["metadata"]["recoverable_formatted"]
         rule_key = self.rule_combobox.get()
         keep_rule = RULE_OPTIONS.get(rule_key, KeepRule.DEEPEST_THEN_NEWEST.value)
-        plan = build_audit_plan(self.last_duplicates, keep_rule=keep_rule)
+        plan = build_audit_plan(self.last_duplicates, keep_rule=keep_rule, base_dir=self.current_base_dir)
 
-        # Opción 3 (Arquitectura Avanzada): Deduplicación Transparente mediante Hardlinks (OS-Level)
+        # 1. Determinar modo de mitigación y solicitar confirmación en el Main Thread
+        op_mode = None
         if getattr(self, "hardlink_mode_var", None) and self.hardlink_mode_var.get():
             resp = messagebox.askyesno(
                 "Confirmar Deduplicación Transparente con Hardlinks (OS-Level)",
@@ -2053,42 +2072,10 @@ class DataCleanerGUI:
             )
             if not resp:
                 return
-
-            try:
-                res_hl: HardlinkResult = deduplicate_with_hardlinks(plan)
-                self.history_manager.record_event(
-                    action_type="HARDLINK",
-                    target_dir=str(self.current_base_dir),
-                    files_count=res_hl.total_linked,
-                    bytes_affected=res_hl.total_bytes_saved,
-                    details="Enlaces físicos OS-Level (os.link)"
-                )
-                self._refresh_history_view()
-                self._log(
-                    f"\n✔ Deduplicación Hardlink OS-Level: {res_hl.total_linked} archivos enlazados "
-                    f"({format_bytes_with_equivalence(res_hl.total_bytes_saved)} liberados sin alterar rutas)."
-                )
-                if res_hl.errors:
-                    for err in res_hl.errors:
-                        self._log(f"  ⚠ {err}")
-
-                messagebox.showinfo(
-                    "Deduplicación por Hardlinks Completada",
-                    f"Se enlazaron físicamente {res_hl.total_linked} archivos liberando "
-                    f"{format_bytes_with_equivalence(res_hl.total_bytes_saved)}.\n\n"
-                    f"Todas las rutas originales permanecen intactas en su árbol de directorios."
-                )
-                self.quarantine_btn.configure(state="disabled", style="TButton")
-                self._start_scan_thread()
-            except Exception as e:
-                messagebox.showerror("Error en Hardlinks", f"Ocurrió un error al crear enlaces físicos: {e}")
-            return
-
-        # Opción 2 y 3: Eliminación directa (Papelera de Windows o Destrucción Permanente)
-        if self.direct_delete_var.get():
+            op_mode = "HARDLINK"
+        elif self.direct_delete_var.get():
             use_trash = self.use_trash_var.get()
             if use_trash:
-                # Opción 3: Enviar a la Papelera de Reciclaje nativa de Windows (send2trash)
                 resp = messagebox.askyesno(
                     "Confirmar Envío a Papelera de Reciclaje",
                     f"¿Desea enviar {total_redundant} archivos duplicados ({rec_str}) a la Papelera de Reciclaje de Windows?\n\n"
@@ -2098,32 +2085,8 @@ class DataCleanerGUI:
                 )
                 if not resp:
                     return
-
-                try:
-                    res_del: DeleteResult = execute_deletion_plan(plan, use_trash=True)
-                    self.history_manager.record_event(
-                        action_type="TRASH",
-                        target_dir=str(self.current_base_dir),
-                        files_count=res_del.total_deleted,
-                        bytes_affected=res_del.total_bytes_deleted,
-                        details="Papelera de Reciclaje de Windows"
-                    )
-                    self._refresh_history_view()
-                    self._log(f"\n✔ Papelera de Reciclaje: {res_del.total_deleted} archivos ({format_bytes_with_equivalence(res_del.total_bytes_deleted)}) enviados a la Papelera.")
-                    if res_del.errors:
-                        for err in res_del.errors:
-                            self._log(f"  ⚠ {err}")
-
-                    messagebox.showinfo(
-                        "Operación Completada",
-                        f"Se enviaron {res_del.total_deleted} archivos ({format_bytes_with_equivalence(res_del.total_bytes_deleted)}) a la Papelera de Reciclaje de Windows."
-                    )
-                    self.quarantine_btn.configure(state="disabled", style="TButton")
-                    self._start_scan_thread()
-                except Exception as e:
-                    messagebox.showerror("Error al Enviar a Papelera", f"Ocurrió un error al procesar los archivos: {e}")
+                op_mode = "TRASH"
             else:
-                # Opción 2: Eliminación permanente irreversible (Path.unlink / os.remove)
                 resp = messagebox.askyesno(
                     "⚠️ Confirmar Eliminación Permanente (Irreversible)",
                     f"¿Está seguro de que desea ELIMINAR PERMANENTEMENTE {total_redundant} archivos duplicados ({rec_str})?\n\n"
@@ -2136,8 +2099,82 @@ class DataCleanerGUI:
                 )
                 if not resp:
                     return
+                op_mode = "PERMANENT"
+        else:
+            resp = messagebox.askyesno(
+                "Confirmar Cuarentena (Soft-Delete)",
+                f"¿Desea mover {total_redundant} archivos duplicados ({rec_str}) a la carpeta de aislamiento?\n\n"
+                f"Garantía de Cero Pérdida de Datos:\n"
+                f"• Los archivos NO serán borrados permanentemente.\n"
+                f"• Se trasladarán a una carpeta de cuarentena preservando su estructura.\n"
+                f"• Podrá restaurarlos en cualquier momento o vaciar la cuarentena desde 'Vaciar Cuarentena'.",
+                icon="question"
+            )
+            if not resp:
+                return
+            op_mode = "QUARANTINE"
 
-                try:
+        # 2. Desactivar controles y activar barra de progreso indeterminada durante el I/O
+        self.is_processing = True
+        self.quarantine_btn.configure(state="disabled")
+        self.scan_btn.configure(state="disabled")
+        self.progress_bar.configure(mode="indeterminate")
+        self.progress_bar.start(10)
+        self.status_label.configure(text=f"⏳ Ejecutando operación ({op_mode}) en segundo plano...")
+
+        # 3. Función auxiliar para ejecutar el I/O en hilo secundario (Non-blocking GUI)
+        def _bg_worker():
+            try:
+                if op_mode == "HARDLINK":
+                    res_hl: HardlinkResult = deduplicate_with_hardlinks(plan)
+                    self.history_manager.record_event(
+                        action_type="HARDLINK",
+                        target_dir=str(self.current_base_dir),
+                        files_count=res_hl.total_linked,
+                        bytes_affected=res_hl.total_bytes_saved,
+                        details="Enlaces físicos OS-Level (os.link)"
+                    )
+                    def on_hl_done():
+                        self._finish_mitigation()
+                        self._log(
+                            f"\n✔ Deduplicación Hardlink OS-Level: {res_hl.total_linked} archivos enlazados "
+                            f"({format_bytes_with_equivalence(res_hl.total_bytes_saved)} liberados sin alterar rutas)."
+                        )
+                        if res_hl.errors:
+                            for err in res_hl.errors:
+                                self._log(f"  ⚠ {err}")
+                        messagebox.showinfo(
+                            "Deduplicación por Hardlinks Completada",
+                            f"Se enlazaron físicamente {res_hl.total_linked} archivos liberando "
+                            f"{format_bytes_with_equivalence(res_hl.total_bytes_saved)}.\n\n"
+                            f"Todas las rutas originales permanecen intactas en su árbol de directorios."
+                        )
+                        self._start_scan_thread()
+                    self.root.after(0, on_hl_done)
+
+                elif op_mode == "TRASH":
+                    res_del: DeleteResult = execute_deletion_plan(plan, use_trash=True)
+                    self.history_manager.record_event(
+                        action_type="TRASH",
+                        target_dir=str(self.current_base_dir),
+                        files_count=res_del.total_deleted,
+                        bytes_affected=res_del.total_bytes_deleted,
+                        details="Papelera de Reciclaje de Windows"
+                    )
+                    def on_trash_done():
+                        self._finish_mitigation()
+                        self._log(f"\n✔ Papelera de Reciclaje: {res_del.total_deleted} archivos ({format_bytes_with_equivalence(res_del.total_bytes_deleted)}) enviados a la Papelera.")
+                        if res_del.errors:
+                            for err in res_del.errors:
+                                self._log(f"  ⚠ {err}")
+                        messagebox.showinfo(
+                            "Operación Completada",
+                            f"Se enviaron {res_del.total_deleted} archivos ({format_bytes_with_equivalence(res_del.total_bytes_deleted)}) a la Papelera de Reciclaje de Windows."
+                        )
+                        self._start_scan_thread()
+                    self.root.after(0, on_trash_done)
+
+                elif op_mode == "PERMANENT":
                     res_del: DeleteResult = execute_deletion_plan(plan, use_trash=False)
                     self.history_manager.record_event(
                         action_type="PERMANENT",
@@ -2146,60 +2183,62 @@ class DataCleanerGUI:
                         bytes_affected=res_del.total_bytes_deleted,
                         details="Borrado directo definitivo"
                     )
-                    self._refresh_history_view()
-                    self._log(f"\n✔ Eliminación permanente: {res_del.total_deleted} archivos ({format_bytes_with_equivalence(res_del.total_bytes_deleted)}) eliminados definitivamente del disco.")
-                    if res_del.errors:
-                        for err in res_del.errors:
-                            self._log(f"  ⚠ {err}")
+                    def on_perm_done():
+                        self._finish_mitigation()
+                        self._log(f"\n✔ Eliminación permanente: {res_del.total_deleted} archivos ({format_bytes_with_equivalence(res_del.total_bytes_deleted)}) eliminados definitivamente del disco.")
+                        if res_del.errors:
+                            for err in res_del.errors:
+                                self._log(f"  ⚠ {err}")
+                        messagebox.showinfo(
+                            "Eliminación Permanente Exitosa",
+                            f"Se eliminaron permanentemente {res_del.total_deleted} archivos ({format_bytes_with_equivalence(res_del.total_bytes_deleted)}) del disco."
+                        )
+                        self._start_scan_thread()
+                    self.root.after(0, on_perm_done)
 
-                    messagebox.showinfo(
-                        "Eliminación Permanente Exitosa",
-                        f"Se eliminaron permanentemente {res_del.total_deleted} archivos ({format_bytes_with_equivalence(res_del.total_bytes_deleted)}) del disco."
+                elif op_mode == "QUARANTINE":
+                    res: QuarantineResult = quarantine_redundant_files(self.current_base_dir, plan)
+                    self.history_manager.record_event(
+                        action_type="QUARANTINE",
+                        target_dir=str(self.current_base_dir),
+                        files_count=res.total_moved,
+                        bytes_affected=res.total_bytes_moved,
+                        details=f"Sesión {res.session_id}"
                     )
-                    self.quarantine_btn.configure(state="disabled", style="TButton")
-                    self._start_scan_thread()
-                except Exception as e:
-                    messagebox.showerror("Error en Eliminación Permanente", f"Ocurrió un error al eliminar los archivos: {e}")
-            return
+                    def on_quar_done():
+                        self._finish_mitigation()
+                        self._log(f"\n✔ Cuarentena completada: {res.total_moved} archivos trasladados a {res.quarantine_dir}")
+                        self._log(f"  Manifiesto generado: {res.manifest_path}")
+                        messagebox.showinfo(
+                            "Cuarentena Exitosa",
+                            f"Se trasladaron {res.total_moved} archivos ({format_bytes_with_equivalence(res.total_bytes_moved)}) a la carpeta de cuarentena.\n\n"
+                            f"Sesión: {res.session_id}\n"
+                            f"Ubicación:\n{res.quarantine_dir}\n\n"
+                            f"Puede restaurarlos en cualquier momento o vaciar la cuarentena desde el gestor de sesiones."
+                        )
+                        self._refresh_quarantine_badge()
+                        self._start_scan_thread()
+                    self.root.after(0, on_quar_done)
 
-        # Opción Recomendada: Aislamiento No Destructivo en Cuarentena (Soft-Delete)
-        resp = messagebox.askyesno(
-            "Confirmar Cuarentena (Soft-Delete)",
-            f"¿Desea mover {total_redundant} archivos duplicados ({rec_str}) a la carpeta de aislamiento?\n\n"
-            f"Garantía de Cero Pérdida de Datos:\n"
-            f"• Los archivos NO serán borrados permanentemente.\n"
-            f"• Se trasladarán a una carpeta de cuarentena preservando su estructura.\n"
-            f"• Podrá restaurarlos en cualquier momento o vaciar la cuarentena desde 'Vaciar Cuarentena'.",
-            icon="question"
-        )
-        if not resp:
-            return
+            except Exception as e:
+                def on_err():
+                    self._finish_mitigation()
+                    messagebox.showerror(f"Error en {op_mode}", f"Ocurrió un error al procesar los archivos: {e}")
+                self.root.after(0, on_err)
 
+        threading.Thread(target=_bg_worker, daemon=True).start()
+
+    def _finish_mitigation(self):
+        """Restaura el estado de la barra de progreso y actualiza la vista de métricas."""
+        self.is_processing = False
         try:
-            res: QuarantineResult = quarantine_redundant_files(self.current_base_dir, plan)
-            self.history_manager.record_event(
-                action_type="QUARANTINE",
-                target_dir=str(self.current_base_dir),
-                files_count=res.total_moved,
-                bytes_affected=res.total_bytes_moved,
-                details=f"Sesión {res.session_id}"
-            )
+            self.progress_bar.stop()
+            self.progress_bar.configure(mode="determinate", value=100)
+            self.scan_btn.configure(state="normal")
+            self.status_label.configure(text="✔ Operación completada con éxito.")
             self._refresh_history_view()
-            self._log(f"\n✔ Cuarentena completada: {res.total_moved} archivos trasladados a {res.quarantine_dir}")
-            self._log(f"  Manifiesto generado: {res.manifest_path}")
-
-            messagebox.showinfo(
-                "Cuarentena Exitosa",
-                f"Se trasladaron {res.total_moved} archivos ({format_bytes_with_equivalence(res.total_bytes_moved)}) a la carpeta de cuarentena.\n\n"
-                f"Sesión: {res.session_id}\n"
-                f"Ubicación:\n{res.quarantine_dir}\n\n"
-                f"Puede restaurarlos en cualquier momento o vaciar la cuarentena desde el gestor de sesiones."
-            )
-            self.quarantine_btn.configure(state="disabled", style="TButton")
-            self._refresh_quarantine_badge()
-            self._start_scan_thread()
-        except Exception as e:
-            messagebox.showerror("Error en Cuarentena", f"Ocurrió un error al mover los archivos: {e}")
+        except Exception:
+            pass
 
     def _open_restore_modal(self):
         """

@@ -58,6 +58,12 @@ class ScanSummary:
     warnings: list[str] = field(default_factory=list)
 
 
+PROTECTED_DIR_NAMES = {
+    ".git", ".svn", ".hg", "__pycache__", ".venv", "venv",
+    "$recycle.bin", "system volume information", "node_modules", "appdata"
+}
+
+
 def is_symlink_or_junction(path: Path) -> bool:
     """Detecta si una ruta es un enlace simbólico o un reparse point (Junction en NTFS/Windows)."""
     try:
@@ -86,7 +92,8 @@ def iter_directory_files(base_dir: Path, on_warning: Callable[[str], None] | Non
 
             safe_dirs = []
             for d in dirs:
-                if d.startswith("_quarantine_"):
+                d_lower = d.lower()
+                if d.startswith("_quarantine_") or d_lower in PROTECTED_DIR_NAMES:
                     continue
 
                 d_path = root_path / d
@@ -130,8 +137,8 @@ async def scan_directory_async(
 ) -> tuple[dict[str, list[Path]], ScanSummary]:
     """
     Motor asíncrono de escaneo con Event Loop no bloqueante (AsyncIO + aiofiles):
-    - Filtro de Bloom para descartar tamaños únicos con memoria RAM O(1).
-    - Caché SQLite transaccional para omitir I/O en archivos no modificados.
+    - Filtrado de tamaños únicos en RAM con complejidad O(1) y huella mínima.
+    - Caché SQLite transaccional pre-cargada en memoria para omitir I/O sin bloquear el loop.
     - Concurrencia masiva regulada por asyncio.Semaphore.
     """
     summary = ScanSummary(base_dir=base_dir)
@@ -143,9 +150,9 @@ async def scan_directory_async(
             warning_callback(msg)
 
     # =========================================================================
-    # FASE 1: Recorrido con Filtro de Bloom en RAM + Detección de Hardlinks
+    # FASE 1: Recorrido O(1) en RAM + Detección de Hardlinks (Zero Disk Reads)
     # =========================================================================
-    bloom_seen = BloomFilter(expected_elements=1_000_000, false_positive_rate=0.01)
+    seen_sizes: set[int] = set()
     pending_unique: dict[int, Path] = {}
     colliding_size_map: dict[int, list[Path]] = {}
     seen_inodes_per_size: dict[int, set[tuple[int, int]]] = {}
@@ -157,14 +164,6 @@ async def scan_directory_async(
             file_size = stat.st_size
             summary.total_bytes_scanned += file_size
 
-            # Validación forense de firmas binarias
-            sig_report = analyze_file_signature(file_path)
-            summary.file_signatures[str(file_path.resolve())] = sig_report
-            if sig_report.is_anomaly:
-                summary.spoofed_extensions_count += 1
-                summary.signature_anomalies.append(sig_report.to_dict())
-                log_warning(sig_report.forensic_note)
-
             # Omitir archivos que ya comparten inodo físico (Hardlinks existentes)
             inode_key = (getattr(stat, "st_dev", 0), getattr(stat, "st_ino", 0))
             if inode_key[1] != 0:
@@ -174,10 +173,10 @@ async def scan_directory_async(
                     continue
                 inodes_set.add(inode_key)
 
-            # Filtro de Bloom: Si el tamaño nunca se ha visto, se almacena en pending_unique.
-            # Solo si colisiona con otro archivo posterior se promueve a colliding_size_map.
-            if file_size not in bloom_seen:
-                bloom_seen.add(file_size)
+            # Clasificación O(1): Si el tamaño nunca se ha visto, se reserva en pending_unique.
+            # Solo si aparece otro archivo con el mismo tamaño se promueve a colliding_size_map.
+            if file_size not in seen_sizes:
+                seen_sizes.add(file_size)
                 pending_unique[file_size] = file_path
             else:
                 if file_size in pending_unique:
@@ -185,9 +184,6 @@ async def scan_directory_async(
                     colliding_size_map[file_size] = [first_fp, file_path]
                 elif file_size in colliding_size_map:
                     colliding_size_map[file_size].append(file_path)
-                else:
-                    # En caso de falso positivo de Bloom, tratar como candidato
-                    colliding_size_map[file_size] = [file_path]
 
         except (PermissionError, OSError) as e:
             summary.unreadable_files_count += 1
@@ -196,6 +192,7 @@ async def scan_directory_async(
 
     summary.bloom_unique_discarded = len(pending_unique)
     pending_unique.clear()
+    seen_sizes.clear()
 
     candidate_files: list[Path] = []
     for f_size, paths in colliding_size_map.items():
@@ -217,6 +214,10 @@ async def scan_directory_async(
     partial_map: dict[tuple[int, str], list[Path]] = {}
     cached_sha_map: dict[Path, str] = {}
     new_cache_entries: list[dict] = []
+    computed_partial_hashes: dict[Path, str] = {}
+
+    # Pre-carga de caché en lote en memoria para búsquedas O(1) sin bloquear el Event Loop
+    cached_data = hist_mgr.load_cache_for_directory(base_dir) if hist_mgr and hasattr(hist_mgr, "load_cache_for_directory") else None
 
     async def _async_phase2(fp: Path) -> tuple[int, str | None, Path]:
         async with io_semaphore:
@@ -229,17 +230,34 @@ async def scan_directory_async(
             except OSError:
                 return 0, None, fp
 
-            # 1. Consulta en Caché de Estado SQLite O(1)
-            if hist_mgr:
+            # 1. Consulta en Caché de Estado O(1) en memoria (sin llamadas bloqueantes a SQLite)
+            if cached_data:
+                entry = None
+                if st_ino and str(st_ino) != "0":
+                    entry = cached_data["by_inode"].get((str(st_dev), str(st_ino)))
+                if not entry:
+                    entry = cached_data["by_path"].get(str(fp.resolve()))
+                if entry and abs(entry["mtime"] - st_mtime) < 1e-4 and entry["file_size"] == f_size:
+                    c_part = entry["partial_hash"]
+                    c_sha = entry["sha256_hash"]
+                    if c_sha and c_part and len(c_part) == 32:
+                        summary.cache_hits += 1
+                        cached_sha_map[fp] = c_sha
+                        computed_partial_hashes[fp] = c_part
+                        return f_size, c_part, fp
+            elif hist_mgr:
                 c_part, c_sha = hist_mgr.get_cached_file_hash(fp, st_dev, st_ino, st_mtime, f_size)
-                if c_sha:
+                if c_sha and c_part and len(c_part) == 32:
                     summary.cache_hits += 1
                     cached_sha_map[fp] = c_sha
-                    return f_size, c_part or "cached_phase2", fp
+                    computed_partial_hashes[fp] = c_part
+                    return f_size, c_part, fp
 
             summary.cache_misses += 1
             # 2. Lectura Asíncrona con aiofiles (primer y último chunk 64 KB)
             p_hash = await compute_partial_hash_async(fp, chunk_size=chunk_size, on_error=log_warning)
+            if p_hash:
+                computed_partial_hashes[fp] = p_hash
             return f_size, p_hash, fp
 
     p2_tasks = [_async_phase2(fp) for fp in candidate_files]
@@ -290,7 +308,7 @@ async def scan_directory_async(
                         "inode": getattr(st, "st_ino", 0),
                         "file_size": st.st_size,
                         "mtime": st.st_mtime,
-                        "partial_hash": "md5_edges",
+                        "partial_hash": computed_partial_hashes.get(fp),
                         "sha256_hash": res_hash,
                     })
                 except OSError:
@@ -335,6 +353,18 @@ async def scan_directory_async(
             redundant_count = len(paths) - 1
             recoverable_bytes += (single_file_size * redundant_count)
             total_dup_files += len(paths)
+
+    # Análisis forense de firmas binarias exclusivamente sobre duplicados confirmados
+    for paths in duplicates.values():
+        for dup_fp in paths:
+            resolved_str = str(dup_fp.resolve())
+            if resolved_str not in summary.file_signatures:
+                sig_report = analyze_file_signature(dup_fp)
+                summary.file_signatures[resolved_str] = sig_report
+                if sig_report.is_anomaly:
+                    summary.spoofed_extensions_count += 1
+                    summary.signature_anomalies.append(sig_report.to_dict())
+                    log_warning(sig_report.forensic_note)
 
     summary.duplicate_groups_count = len(duplicates)
     summary.total_duplicate_files = total_dup_files

@@ -137,5 +137,164 @@ class TestHardeningAndSecurity(unittest.TestCase):
             # El archivo en el symlink_dir no debe contarse por duplicado
             self.assertEqual(summary.total_files_scanned, 1)
 
+    def test_send2trash_fallback_raises_runtime_error(self):
+        """Hardening quarantine.py: Si use_trash=True y HAS_SEND2TRASH=False, abortar con RuntimeError."""
+        import datacleaner.quarantine as q_mod
+        test_file = self.base_path / "test_safety_trash.txt"
+        test_file.write_text("Dato que no debe ser destruido")
+
+        orig_has = q_mod.HAS_SEND2TRASH
+        try:
+            q_mod.HAS_SEND2TRASH = False
+            with self.assertRaises(RuntimeError) as ctx:
+                q_mod.delete_redundant_files([test_file], use_trash=True)
+            self.assertIn("send2trash", str(ctx.exception))
+            # Garantizar que el archivo NO fue eliminado de forma permanente accidental
+            self.assertTrue(test_file.exists())
+        finally:
+            q_mod.HAS_SEND2TRASH = orig_has
+
+    def test_scanner_phase2_real_partial_hash_saved_in_sqlite(self):
+        """Hardening scanner.py: partial_hash guardado en SQLite debe ser el MD5 real (32 hex), no 'md5_edges'."""
+        from datacleaner.history import CleaningHistoryManager
+        db_path = self.base_path / "cache_integrity_test.sqlite"
+        mgr = CleaningHistoryManager(storage_path=db_path)
+
+        dir_test = self.base_path / "cache_check"
+        dir_test.mkdir()
+        f1 = dir_test / "file1.bin"
+        f2 = dir_test / "file2.bin"
+        content = b"K" * 150000
+        f1.write_bytes(content)
+        f2.write_bytes(content)
+
+        dups, summary = scan_directory_for_duplicates(dir_test, history_manager=mgr)
+        self.assertEqual(len(dups), 1)
+
+        with mgr._get_connection() as conn:
+            rows = conn.execute("SELECT file_path, partial_hash, sha256_hash FROM file_hash_cache").fetchall()
+            self.assertGreaterEqual(len(rows), 2)
+            for r in rows:
+                p_hash = r["partial_hash"]
+                self.assertIsNotNone(p_hash)
+                self.assertNotEqual(p_hash, "md5_edges", "El partial_hash no debe ser un placeholder 'md5_edges'")
+                self.assertEqual(len(p_hash), 32, "El partial_hash debe ser un hash MD5 hexadecimal válido")
+
+    def test_rules_cleanliness_no_false_positive_substrings(self):
+        """Hardening rules.py: Nombres como Templates o Copyright no deben ser penalizados por contener 'temp' o 'copy'."""
+        from datacleaner.rules import calculate_path_cleanliness_score
+        templates_path = Path("Templates/project/document.txt")
+        temp_path = Path("temp/project/document.txt")
+        copyright_path = Path("Copyright/project/document.txt")
+        copia_path = Path("copia/project/document.txt")
+
+        score_templates = calculate_path_cleanliness_score(templates_path)
+        score_temp = calculate_path_cleanliness_score(temp_path)
+        score_copyright = calculate_path_cleanliness_score(copyright_path)
+        score_copia = calculate_path_cleanliness_score(copia_path)
+
+        self.assertGreater(score_templates, score_temp)
+        self.assertGreater(score_copyright, score_copia)
+
+    def test_iter_directory_files_skips_git_and_protected_dirs(self):
+        """Hardening scanner.py: Excluir por defecto .git, node_modules y directorios protegidos de sistema."""
+        from datacleaner.scanner import iter_directory_files
+        git_dir = self.base_path / ".git" / "objects"
+        git_dir.mkdir(parents=True)
+        git_file = git_dir / "commit.blob"
+        git_file.write_bytes(b"blob data")
+
+        node_dir = self.base_path / "node_modules" / "pkg"
+        node_dir.mkdir(parents=True)
+        node_file = node_dir / "index.js"
+        node_file.write_bytes(b"js data")
+
+        valid_dir = self.base_path / "src"
+        valid_dir.mkdir(parents=True)
+        valid_file = valid_dir / "app.py"
+        valid_file.write_bytes(b"python code")
+
+        scanned = list(iter_directory_files(self.base_path))
+        scanned_resolved = [p.resolve() for p in scanned]
+
+        self.assertIn(valid_file.resolve(), scanned_resolved)
+        self.assertNotIn(git_file.resolve().as_posix(), [p.as_posix() for p in scanned_resolved])
+        self.assertNotIn(node_file.resolve().as_posix(), [p.as_posix() for p in scanned_resolved])
+
+    def test_user_home_allowed_while_appdata_directly_blocked(self):
+        """Hardening security.py: C:\\Users\\<Usuario> es permitido mientras que AppData directo es bloqueado."""
+        user_home = Path.home()
+        validated_home = validate_target_path(user_home)
+        self.assertEqual(validated_home, user_home.resolve().absolute())
+
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data and Path(local_app_data).exists():
+            with self.assertRaises(PermissionError):
+                validate_target_path(local_app_data)
+
+    def test_load_cache_for_directory_exact_prefix_no_wildcard_leak(self):
+        """Hardening history.py: load_cache_for_directory no debe mezclar C:\\Carpeta con C:\\Carpeta_backup."""
+        from datacleaner.history import CleaningHistoryManager
+        db_file = self.base_path / "cache_prefix_test.sqlite"
+        mgr = CleaningHistoryManager(storage_path=db_file)
+
+        base_a = self.base_path / "proyecto"
+        base_b = self.base_path / "proyecto_backup"
+        base_a.mkdir()
+        base_b.mkdir()
+
+        file_a = base_a / "app.py"
+        file_b = base_b / "app.py"
+        file_a.write_text("code a")
+        file_b.write_text("code b")
+
+        st_a = file_a.stat()
+        st_b = file_b.stat()
+
+        mgr.set_cached_file_hash(file_a, st_a.st_dev, st_a.st_ino, st_a.st_mtime, st_a.st_size, "hash_part_a", "hash_sha_a")
+        mgr.set_cached_file_hash(file_b, st_b.st_dev, st_b.st_ino, st_b.st_mtime, st_b.st_size, "hash_part_b", "hash_sha_b")
+
+        cache_a = mgr.load_cache_for_directory(base_a)
+        self.assertIn(str(file_a.resolve()), cache_a["by_path"])
+        self.assertNotIn(str(file_b.resolve()), cache_a["by_path"], "No debe cargar archivos de directorios con prefijo similar")
+
+    def test_reporter_passes_base_dir_to_cleanliness_scoring(self):
+        """Hardening reporter.py / rules.py: build_audit_plan propaga base_dir para cálculo relativo."""
+        f_dir = self.base_path / "test_base"
+        sub_deep = f_dir / "carpeta" / "sub"
+        sub_deep.mkdir(parents=True)
+        f1 = f_dir / "file.txt"
+        f2 = sub_deep / "file.txt"
+        f1.write_text("identico")
+        f2.write_text("identico")
+
+        dups = {"hash123": [f1, f2]}
+        plan = build_audit_plan(dups, keep_rule="deepest_then_newest", base_dir=f_dir)
+        self.assertEqual(len(plan), 1)
+        self.assertEqual(plan[0]["keep"].resolve(), f2.resolve())
+
+    def test_cli_execute_quarantine_records_history_event(self):
+        """Hardening cli.py: _execute_quarantine registra el evento en CleaningHistoryManager."""
+        from datacleaner.cli import _execute_quarantine
+        from datacleaner.history import CleaningHistoryManager
+        mgr = CleaningHistoryManager()
+        initial_ops = mgr.get_summary().total_operations
+
+        d1 = self.base_path / "cli_d1"
+        d2 = self.base_path / "cli_d2"
+        d1.mkdir()
+        d2.mkdir()
+        f1 = d1 / "f.txt"
+        f2 = d2 / "f.txt"
+        content = b"cli history test content"
+        f1.write_bytes(content)
+        f2.write_bytes(content)
+
+        dups = {"hash_cli_1": [f1, f2]}
+        _execute_quarantine(self.base_path, dups, "deepest_then_newest")
+
+        after_ops = mgr.get_summary().total_operations
+        self.assertGreater(after_ops, initial_ops)
+
 if __name__ == "__main__":
     unittest.main()

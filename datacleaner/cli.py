@@ -33,6 +33,7 @@ from datacleaner.reporter import (
     export_report_json,
     format_bytes
 )
+from datacleaner.history import CleaningHistoryManager
 
 console = Console()
 
@@ -136,8 +137,20 @@ def cmd_quarantine(args: argparse.Namespace):
                 console.print("[dim]Operación cancelada por el usuario.[/dim]")
                 return
 
-        plan = build_audit_plan(duplicates, keep_rule=args.keep_rule)
+        plan = build_audit_plan(duplicates, keep_rule=args.keep_rule, base_dir=target_dir)
         del_res = execute_deletion_plan(plan, use_trash=use_trash)
+        if del_res.total_deleted > 0:
+            try:
+                CleaningHistoryManager().record_event(
+                    action_type="TRASH" if del_res.used_trash else "PERMANENT",
+                    target_dir=str(target_dir),
+                    files_count=del_res.total_deleted,
+                    bytes_affected=del_res.total_bytes_deleted,
+                    details="CLI: Papelera de Reciclaje" if del_res.used_trash else "CLI: Eliminación permanente"
+                )
+            except Exception:
+                pass
+
         console.print(f"\n[bold green][OK] Eliminación directa finalizada.[/bold green]")
         console.print(f"  * Archivos eliminados: [bold]{del_res.total_deleted}[/bold] ({format_bytes(del_res.total_bytes_deleted)})")
         console.print(f"  * Modo: {'Papelera de Reciclaje (send2trash)' if del_res.used_trash else 'Permanente (unlink)'}")
@@ -162,10 +175,22 @@ def cmd_quarantine(args: argparse.Namespace):
 def _execute_quarantine(base_dir: Path, duplicates: dict, keep_rule: str, custom_dir: str | None = None):
     """Función auxiliar para trasladar a cuarentena y presentar resultado."""
     custom_p = Path(custom_dir) if custom_dir else None
-    plan = build_audit_plan(duplicates, keep_rule=keep_rule)
+    plan = build_audit_plan(duplicates, keep_rule=keep_rule, base_dir=base_dir)
 
     with console.status("[yellow]Trasladando archivos redundantes a directorio de Cuarentena...[/yellow]"):
         result = quarantine_redundant_files(base_dir, plan, custom_quarantine_dir=custom_p)
+
+    if result.total_moved > 0:
+        try:
+            CleaningHistoryManager().record_event(
+                action_type="QUARANTINE",
+                target_dir=str(base_dir),
+                files_count=result.total_moved,
+                bytes_affected=result.total_bytes_moved,
+                details=f"CLI: Sesión {result.session_id}"
+            )
+        except Exception:
+            pass
 
     console.print()
     console.print(f"[bold green][OK] Cuarentena completada con exito.[/bold green]")
@@ -198,6 +223,17 @@ def cmd_restore(args: argparse.Namespace):
 
     console.print(f"\n[bold green][OK] Restauracion finalizada.[/bold green]")
     console.print(f"  * Archivos devueltos a su origen: [bold]{res.total_restored}[/bold] ({format_bytes(res.total_bytes_restored)})")
+    if res.total_restored > 0:
+        try:
+            CleaningHistoryManager().record_event(
+                action_type="RESTORE",
+                target_dir=str(manifest_p.parent),
+                files_count=res.total_restored,
+                bytes_affected=res.total_bytes_restored,
+                details=f"CLI: Restauración desde {manifest_p.name}"
+            )
+        except Exception:
+            pass
     if res.skipped_count:
         console.print(f"  • Archivos omitidos (ya restaurados anteriormente): [dim]{res.skipped_count}[/dim]")
 
@@ -233,7 +269,21 @@ def cmd_purge(args: argparse.Namespace):
             console.print("[dim]Operación cancelada por el usuario. No se modificó ningún archivo.[/dim]")
             return
 
+    total_purged_files = sum(s.get("total_files", 0) for s in sessions)
+    total_purged_bytes = sum(s.get("total_bytes", 0) for s in sessions)
     purged = purge_all_quarantine_sessions(target_dir)
+    if purged > 0:
+        try:
+            CleaningHistoryManager().record_event(
+                action_type="PURGE",
+                target_dir=str(target_dir),
+                files_count=total_purged_files,
+                bytes_affected=total_purged_bytes,
+                details=f"CLI: Purga de {purged} sesión(es) de cuarentena"
+            )
+        except Exception:
+            pass
+
     console.print(f"\n[bold green][OK] Se purgaron {purged} sesión(es) de cuarentena definitivamente.[/bold green]\n")
 
 def cmd_gui(args: argparse.Namespace):

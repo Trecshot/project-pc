@@ -32,7 +32,8 @@ def format_bytes(bytes_count: int) -> str:
 
 def build_audit_plan(
     duplicates: dict[str, list[Path]],
-    keep_rule: str = "deepest_then_newest"
+    keep_rule: str = "deepest_then_newest",
+    base_dir: Path | None = None
 ) -> list[dict[str, Any]]:
     """
     Construye el plan de auditoría determinando para cada hash qué archivo se conserva
@@ -40,7 +41,7 @@ def build_audit_plan(
     """
     plan = []
     for sha, paths in duplicates.items():
-        kept_file, quarantine_files = select_file_to_keep(paths, rule=keep_rule)
+        kept_file, quarantine_files = select_file_to_keep(paths, rule=keep_rule, base_dir=base_dir)
         try:
             size = paths[0].stat().st_size
         except (OSError, IndexError):
@@ -73,7 +74,7 @@ def generate_report_dict(
     keep_rule: str = "deepest_then_newest"
 ) -> dict[str, Any]:
     """Genera la estructura de diccionario completa para reporte / exportación JSON."""
-    plan = build_audit_plan(duplicates, keep_rule=keep_rule)
+    plan = build_audit_plan(duplicates, keep_rule=keep_rule, base_dir=base_dir)
 
     total_quarantine_files = sum(len(item["quarantine"]) for item in plan)
     total_recoverable_bytes = sum(item["recoverable_bytes"] for item in plan)

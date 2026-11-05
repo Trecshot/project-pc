@@ -7,6 +7,8 @@ Reemplaza el motor de persistencia plano JSON por el módulo estándar sqlite3
 para conservar el acoplamiento con `gui.py` y `cli.py`.
 """
 
+import os
+import sys
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, asdict
@@ -15,9 +17,18 @@ import sqlite3
 import json
 
 
-DEFAULT_DATABASE = Path(__file__).resolve().parent.parent / ".datacleaner.sqlite"
+def _get_default_storage_dir() -> Path:
+    # Si se ejecuta compilado con Nuitka / PyInstaller, usar AppData Local del usuario
+    if "__compiled__" in globals() or getattr(sys, "frozen", False):
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "DataCleaner"
+        base.mkdir(parents=True, exist_ok=True)
+        return base
+    return Path(__file__).resolve().parent.parent
+
+
+DEFAULT_DATABASE = _get_default_storage_dir() / ".datacleaner.sqlite"
 DEFAULT_HISTORY_FILE = DEFAULT_DATABASE
-LEGACY_JSON_HISTORY = Path(__file__).resolve().parent.parent / ".datacleaner_history.json"
+LEGACY_JSON_HISTORY = _get_default_storage_dir() / ".datacleaner_history.json"
 
 
 def format_bytes_auto(bytes_count: int | float, target_unit: str = "AUTO") -> str:
@@ -267,6 +278,50 @@ class CleaningHistoryManager:
                 conn.commit()
         except Exception:
             pass
+
+    def load_cache_for_directory(self, base_dir: Path | str) -> dict[str, Any]:
+        """
+        Carga en memoria todos los registros de caché correspondientes al directorio base
+        en una sola consulta SQL agrupada, permitiendo búsquedas O(1) en memoria sin
+        abrir conexiones SQLite repetidas durante el bucle asíncrono.
+        Utiliza comparación exacta por prefijo con substr para evitar el comportamiento
+        de comodines % y _ de LIKE, previniendo falsas colisiones entre carpetas con prefijo común.
+        """
+        resolved_dir = str(Path(base_dir).resolve())
+        prefix = resolved_dir if resolved_dir.endswith(os.sep) else resolved_dir + os.sep
+        by_path: dict[str, dict[str, Any]] = {}
+        by_inode: dict[tuple[str, str], dict[str, Any]] = {}
+
+        try:
+            with self._get_connection() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT file_path, device_id, inode, file_size, mtime, partial_hash, sha256_hash
+                    FROM file_hash_cache
+                    WHERE substr(file_path, 1, ?) = ?
+                    """,
+                    (len(prefix), prefix)
+                ).fetchall()
+
+                for r in rows:
+                    entry = {
+                        "file_path": r["file_path"],
+                        "device_id": str(r["device_id"]),
+                        "inode": str(r["inode"]),
+                        "file_size": int(r["file_size"]),
+                        "mtime": float(r["mtime"]),
+                        "partial_hash": r["partial_hash"],
+                        "sha256_hash": r["sha256_hash"],
+                    }
+                    by_path[r["file_path"]] = entry
+                    dev = str(r["device_id"] or "")
+                    ino = str(r["inode"] or "")
+                    if ino and ino != "0":
+                        by_inode[(dev, ino)] = entry
+        except Exception:
+            pass
+
+        return {"by_path": by_path, "by_inode": by_inode}
 
     def get_cached_file_hash(
         self,

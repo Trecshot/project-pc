@@ -401,6 +401,12 @@ def delete_redundant_files(
         use_trash: Si es True, envía a la Papelera mediante send2trash.
                    Si es False, desvincula permanentemente con unlink()/os.remove().
     """
+    if use_trash and not HAS_SEND2TRASH:
+        raise RuntimeError(
+            "No se puede enviar a la Papelera porque el módulo 'send2trash' no está instalado. "
+            "Se abortó la operación para proteger sus archivos de un borrado permanente accidental."
+        )
+
     deleted_paths: list[str] = []
     errors: list[str] = []
     total_deleted = 0

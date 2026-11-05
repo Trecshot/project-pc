@@ -42,19 +42,29 @@ class BloomFilter:
         self._count = 0
 
     def _get_hashes(self, item: Any) -> list[int]:
-        """Genera k índices de bits usando doble hashing (Kirsch-Mitzenmacher) con SHA-256."""
-        if isinstance(item, bytes):
-            data = item
-        elif isinstance(item, str):
-            data = item.encode("utf-8")
-        elif isinstance(item, int):
-            data = item.to_bytes(8, byteorder="little", signed=True)
+        """Genera k índices de bits usando doble hashing (Kirsch-Mitzenmacher) de alta velocidad sin SHA-256."""
+        if isinstance(item, int):
+            val = item & 0xFFFFFFFFFFFFFFFF
+            h1 = ((val ^ (val >> 30)) * 0xbf58476d1ce4e5b9) & 0xFFFFFFFFFFFFFFFF
+            h1 = ((h1 ^ (h1 >> 27)) * 0x94d049bb133111eb) & 0xFFFFFFFFFFFFFFFF
+            h1 ^= (h1 >> 31)
+            h2 = ((val ^ 0x9e3779b97f4a7c15) * 0xbf58476d1ce4e5b9) & 0xFFFFFFFFFFFFFFFF
+            h2 = ((h2 ^ (h2 >> 27)) * 0x94d049bb133111eb) & 0xFFFFFFFFFFFFFFFF
+            h2 ^= (h2 >> 31)
+            h2 = h2 or 1
         else:
-            data = str(item).encode("utf-8")
-
-        digest = hashlib.sha256(data).digest()
-        h1 = int.from_bytes(digest[:8], byteorder="little")
-        h2 = int.from_bytes(digest[8:16], byteorder="little") or 1
+            if isinstance(item, bytes):
+                data = item
+            elif isinstance(item, str):
+                data = item.encode("utf-8")
+            else:
+                data = str(item).encode("utf-8")
+            # FNV-1a 64-bit hash
+            h1 = 0xcbf29ce484222325
+            for b in data:
+                h1 = ((h1 ^ b) * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
+            h2 = ((h1 * 0x9e3779b97f4a7c15) >> 16) & 0xFFFFFFFFFFFFFFFF
+            h2 = h2 or 1
 
         indices = []
         for i in range(self.hash_count):

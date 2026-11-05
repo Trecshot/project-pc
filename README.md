@@ -8,7 +8,7 @@ DataCleaner es una herramienta de escritorio y consola (Windows 11 Fluent Design
 ## ✨ Lo Destacado
 
 - ⚡ **Multi-Stage Hashing (`O(1)` → `O(k)` → `O(n)`)**:
-  1. **Fase 1 (`st_size` + Bloom Filter en RAM)**: Agrupación instantánea por tamaño y descarte probabilístico $O(1)$ con huella de RAM casi nula (< 50 KB para millones de archivos).
+  1. **Fase 1 (`st_size` + Conjuntos Nativos en RAM)**: Agrupación instantánea por tamaño y descarte exacto $O(1)$ mediante conjuntos indexados en C sin apertura previa de archivos en disco.
   2. **Fase 2 (`Fast-Hash 128 KB`)**: Lectura exclusiva del primer y último bloque de `64 KB` (`MD5` + `seek`) para descartar falsas colisiones en archivos masivos (ISOs, contenedores, bases de datos) sin leer el archivo completo.
   3. **Fase 3 (`SHA-256`)**: Verificación criptográfica completa solo cuando los extremos colisionan.
 - 🚀 **Caché de Estado Hashed (Stateful Caching `O(1)`) & E/S Asíncrona**:
@@ -77,7 +77,7 @@ datacleaner/
 
 ## 🧪 Pruebas Automatizadas
 
-Cuenta con **38 pruebas unitarias** que validan seguridad, pipeline Multi-Stage, firmas Magic Numbers, hardlinks, ciclo de cuarentena/restauración, Stateful Cache, Bloom Filters y E/S asíncrona:
+Cuenta con **46 pruebas unitarias** que validan seguridad y hardening, pipeline Multi-Stage, firmas Magic Numbers, hardlinks, ciclo de cuarentena/restauración, Stateful Cache y E/S asíncrona:
 
 ```bash
 python -m pytest -v
