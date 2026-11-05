@@ -408,6 +408,45 @@ class CleaningHistoryManager:
             entries=entries
         )
 
+    def get_timeseries_points(self) -> list[dict[str, Any]]:
+        """
+        Extrae la serie temporal cronológica desde `operations_history` en SQLite
+        calculando la curva acumulada de memoria recuperada a lo largo del tiempo
+        para graficar en el panel analítico (`matplotlib` / Tkinter).
+        """
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT timestamp, action_type, bytes_count, files_count
+                FROM operations_history
+                ORDER BY timestamp ASC, rowid ASC
+                """
+            ).fetchall()
+
+        points: list[dict[str, Any]] = []
+        cumulative_bytes = 0
+        for idx, r in enumerate(rows, start=1):
+            act = r["action_type"]
+            b_cnt = int(r["bytes_count"] or 0)
+            if act in ("QUARANTINE", "HARDLINK", "TRASH", "PERMANENT"):
+                cumulative_bytes += b_cnt
+            elif act == "RESTORE":
+                cumulative_bytes = max(0, cumulative_bytes - b_cnt)
+
+            ts_raw = str(r["timestamp"] or "")
+            short_ts = ts_raw[5:16] if len(ts_raw) >= 16 else f"#{idx}"
+            points.append({
+                "index": idx,
+                "timestamp": ts_raw,
+                "label": short_ts,
+                "action_type": act,
+                "delta_bytes": b_cnt,
+                "cumulative_bytes": cumulative_bytes,
+                "cumulative_mb": round(cumulative_bytes / (1024.0 ** 2), 3),
+                "cumulative_gb": round(cumulative_bytes / (1024.0 ** 3), 4),
+            })
+        return points
+
     def clear_history(self) -> None:
         with self._get_connection() as conn:
             conn.executescript(

@@ -35,6 +35,13 @@ from datacleaner.history import (
     format_bytes_auto,
     format_bytes_with_equivalence
 )
+from datacleaner.scheduler import (
+    build_schtasks_create_command,
+    register_scheduled_scan,
+    query_scheduled_scan,
+    remove_scheduled_scan,
+    ScheduledTaskResult,
+)
 
 __version__ = "1.0.0"
 __all__ = [
@@ -69,5 +76,10 @@ __all__ = [
     "HistoryEntry",
     "HistorySummary",
     "format_bytes_auto",
-    "format_bytes_with_equivalence"
+    "format_bytes_with_equivalence",
+    "build_schtasks_create_command",
+    "register_scheduled_scan",
+    "query_scheduled_scan",
+    "remove_scheduled_scan",
+    "ScheduledTaskResult",
 ]

@@ -32,6 +32,15 @@ try:
 except ImportError:
     HAS_SV_TTK = False
 
+try:
+    import matplotlib
+    matplotlib.use("TkAgg")
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+    HAS_MATPLOTLIB = True
+except Exception:
+    HAS_MATPLOTLIB = False
+
 from datacleaner.security import validate_target_path
 from datacleaner.scanner import scan_directory_for_duplicates, ScanSummary
 from datacleaner.rules import KeepRule
@@ -61,6 +70,12 @@ from datacleaner.history import (
     CleaningHistoryManager,
     format_bytes_auto,
     format_bytes_with_equivalence
+)
+from datacleaner.scheduler import (
+    register_scheduled_scan,
+    query_scheduled_scan,
+    remove_scheduled_scan,
+    DEFAULT_TASK_NAME,
 )
 
 RULE_OPTIONS = {
@@ -688,6 +703,8 @@ class DataCleanerGUI:
             )
         self._update_validation_label_color()
         self._update_tag_colors()
+        if hasattr(self, "chart_frame"):
+            self._render_history_chart()
 
     def _update_validation_label_color(self):
         if not hasattr(self, "validation_label"):
@@ -948,7 +965,7 @@ class DataCleanerGUI:
         )
         self.quarantine_btn.pack(side="left", padx=(0, 16))
 
-        # Grupo Derecho: Exportación y Gestión de Sesiones de Cuarentena
+        # Grupo Derecho: Exportación, Programación Automática y Gestión de Sesiones
         self.export_btn = ttk.Button(
             action_bar,
             text="💾 Exportar JSON",
@@ -956,6 +973,13 @@ class DataCleanerGUI:
             state="disabled"
         )
         self.export_btn.pack(side="right")
+
+        self.schedule_btn = ttk.Button(
+            action_bar,
+            text="⏰ Programar Escaneo",
+            command=self._open_scheduler_modal
+        )
+        self.schedule_btn.pack(side="right", padx=(0, 8))
 
         self.purge_bar_btn = ttk.Button(
             action_bar,
@@ -1275,6 +1299,12 @@ class DataCleanerGUI:
         )
         export_hist_btn.pack(side="right", padx=(0, 8))
 
+        # Panel de Visualización Analítica (matplotlib embebido en Tkinter)
+        self.chart_frame = ttk.Frame(tab_history, style="Card.TFrame", padding=(8, 4))
+        self.chart_frame.pack(fill="x", pady=(0, 8))
+        self._mpl_canvas = None
+        self._mpl_fig = None
+
         # Tabla Treeview del Historial
         hist_table_frame = ttk.Frame(tab_history)
         hist_table_frame.pack(fill="both", expand=True)
@@ -1388,6 +1418,206 @@ class DataCleanerGUI:
                     ),
                     tags=(tag,)
                 )
+
+        if hasattr(self, "chart_frame"):
+            self._render_history_chart()
+
+    def _render_history_chart(self):
+        """
+        Renderiza mediante matplotlib embebido en Tkinter (FigureCanvasTkAgg)
+        la tendencia histórica de memoria recuperada consultada desde SQLite.
+        """
+        for child in self.chart_frame.winfo_children():
+            child.destroy()
+
+        points = self.history_manager.get_timeseries_points()
+        is_dark = (self.current_theme == "dark")
+
+        bg_color = "#1C1F24" if is_dark else "#F8FAFC"
+        fg_color = "#E6EDF3" if is_dark else "#1F2328"
+        line_color = "#4CC2FF" if is_dark else "#005FB8"
+        grid_color = "#30363D" if is_dark else "#D0D7DE"
+
+        if not HAS_MATPLOTLIB:
+            ttk.Label(
+                self.chart_frame,
+                text="📈 Visualización de serie temporal (Instale matplotlib para ver el gráfico interactivo).",
+                font=("Segoe UI", 9)
+            ).pack(anchor="w", padx=6, pady=4)
+            return
+
+        fig = Figure(figsize=(8.5, 1.55), dpi=96, facecolor=bg_color)
+        ax = fig.add_subplot(111)
+        ax.set_facecolor(bg_color)
+
+        if not points:
+            ax.text(
+                0.5,
+                0.5,
+                "📈 Tendencia de Memoria Recuperada (Sin eventos aún — ejecute una limpieza para graficar)",
+                ha="center",
+                va="center",
+                color=fg_color,
+                fontsize=9,
+                transform=ax.transAxes,
+            )
+            ax.set_xticks([])
+            ax.set_yticks([])
+        else:
+            max_bytes = max(p["cumulative_bytes"] for p in points)
+            use_gb = max_bytes >= (1000 * 1024 * 1024)
+            unit_lbl = "GB" if use_gb else "MB"
+            y_vals = [p["cumulative_gb"] if use_gb else p["cumulative_mb"] for p in points]
+            x_labels = [p["label"] for p in points]
+            x_idx = list(range(len(points)))
+
+            ax.plot(x_idx, y_vals, color=line_color, marker="o", linewidth=2, markersize=4)
+            ax.fill_between(x_idx, y_vals, color=line_color, alpha=0.18)
+            ax.set_title(
+                f"Tendencia Histórica de Memoria Recuperada ({unit_lbl})",
+                color=fg_color,
+                fontsize=9,
+                fontweight="bold",
+                pad=6,
+            )
+            ax.set_ylabel(unit_lbl, color=fg_color, fontsize=8)
+            ax.grid(True, linestyle="--", linewidth=0.5, color=grid_color, alpha=0.7)
+
+            # Limitar etiquetas del eje X para mantener legibilidad
+            step = max(1, len(x_idx) // 6)
+            tick_positions = x_idx[::step]
+            tick_labels = [x_labels[i] for i in tick_positions]
+            ax.set_xticks(tick_positions)
+            ax.set_xticklabels(tick_labels, color=fg_color, fontsize=7.5)
+            ax.tick_params(axis="y", colors=fg_color, labelsize=7.5)
+
+        for spine in ax.spines.values():
+            spine.set_color(grid_color)
+
+        fig.tight_layout(pad=0.6)
+        canvas = FigureCanvasTkAgg(fig, master=self.chart_frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill="x", expand=True)
+        self._mpl_canvas = canvas
+        self._mpl_fig = fig
+
+    def _open_scheduler_modal(self):
+        """
+        Abre el diálogo de configuración de Tareas Programadas (Windows Task Scheduler API)
+        para automatizar escaneos y cuarentenas en segundo plano sin abrir la GUI.
+        """
+        win = tk.Toplevel(self.root)
+        win.title("⏰ Programar Auditoría Automática — Windows Task Scheduler")
+        win.geometry("620x380")
+        win.minsize(560, 350)
+        win.transient(self.root)
+        win.grab_set()
+        apply_windows_titlebar_theme(win, self.current_theme == "dark")
+
+        container = ttk.Frame(win, padding=(20, 16))
+        container.pack(fill="both", expand=True)
+
+        ttk.Label(
+            container,
+            text="⏰ Automatización con Windows Task Scheduler",
+            font=("Segoe UI", 14, "bold")
+        ).pack(anchor="w")
+        ttk.Label(
+            container,
+            text="Configure auditorías periódicas en segundo plano sin necesidad de abrir la interfaz gráfica.",
+            font=("Segoe UI", 9)
+        ).pack(anchor="w", pady=(2, 12))
+
+        form = ttk.Frame(container, style="Card.TFrame", padding=14)
+        form.pack(fill="x", pady=(0, 12))
+
+        # Carpeta objetivo
+        row_dir = ttk.Frame(form)
+        row_dir.pack(fill="x", pady=(0, 8))
+        ttk.Label(row_dir, text="📁 Carpeta a auditar:", font=("Segoe UI", 9, "bold"), width=20).pack(side="left")
+        dir_var = tk.StringVar(value=str(self.current_base_dir or (Path.home() / "Downloads")))
+        dir_entry = ttk.Entry(row_dir, textvariable=dir_var, font=("Segoe UI", 9))
+        dir_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+        def _pick_sched_dir():
+            chosen = filedialog.askdirectory(title="Seleccionar carpeta para tarea programada", parent=win)
+            if chosen:
+                dir_var.set(chosen)
+
+        ttk.Button(row_dir, text="Examinar...", command=_pick_sched_dir).pack(side="left")
+
+        # Frecuencia y Hora
+        row_freq = ttk.Frame(form)
+        row_freq.pack(fill="x", pady=(0, 8))
+        ttk.Label(row_freq, text="📅 Frecuencia:", font=("Segoe UI", 9, "bold"), width=20).pack(side="left")
+        freq_var = tk.StringVar(value="WEEKLY")
+        freq_combo = ttk.Combobox(
+            row_freq,
+            textvariable=freq_var,
+            values=["DAILY", "WEEKLY", "MONTHLY"],
+            state="readonly",
+            width=16,
+            font=("Segoe UI", 9)
+        )
+        freq_combo.pack(side="left", padx=(0, 16))
+
+        ttk.Label(row_freq, text="🕒 Hora (HH:MM):", font=("Segoe UI", 9, "bold")).pack(side="left", padx=(0, 6))
+        time_var = tk.StringVar(value="09:00")
+        ttk.Entry(row_freq, textvariable=time_var, width=10, font=("Segoe UI", 9)).pack(side="left")
+
+        # Estado actual de la tarea en Windows
+        is_active, status_msg = query_scheduled_scan()
+        status_lbl = ttk.Label(
+            container,
+            text=f"Estado actual ({DEFAULT_TASK_NAME}): {'✅ ACTIVA' if is_active else '⚪ Sin programar'}",
+            font=("Segoe UI", 9, "bold")
+        )
+        status_lbl.pack(anchor="w", pady=(0, 10))
+
+        btn_row = ttk.Frame(container)
+        btn_row.pack(fill="x", side="bottom")
+
+        def _save_schedule():
+            rule_key = self.rule_combobox.get()
+            keep_rule = RULE_OPTIONS.get(rule_key, KeepRule.DEEPEST_THEN_NEWEST.value)
+            try:
+                res = register_scheduled_scan(
+                    target_dir=dir_var.get().strip(),
+                    schedule_type=freq_var.get().strip(),
+                    start_time=time_var.get().strip(),
+                    keep_rule=keep_rule,
+                )
+                if res.success:
+                    status_lbl.configure(text=f"✅ Tarea registrada ({res.schedule_type} a las {res.start_time})")
+                    messagebox.showinfo("Tarea Programada", f"Se registró exitosamente en Windows Task Scheduler:\n\n{res.message}", parent=win)
+                else:
+                    messagebox.showwarning("Aviso del Programador de Tareas", f"Respuesta de schtasks:\n{res.message}", parent=win)
+            except Exception as exc:
+                messagebox.showerror("Error de Validación", str(exc), parent=win)
+
+        def _delete_schedule():
+            ok, msg = remove_scheduled_scan()
+            status_lbl.configure(text=f"Estado actual ({DEFAULT_TASK_NAME}): ⚪ Sin programar")
+            messagebox.showinfo("Tarea Eliminada" if ok else "Información", msg, parent=win)
+
+        ttk.Button(
+            btn_row,
+            text="✅ Activar / Actualizar Tarea",
+            style="Accent.TButton",
+            command=_save_schedule
+        ).pack(side="left", padx=(0, 8))
+
+        ttk.Button(
+            btn_row,
+            text="🗑️ Desactivar Tarea",
+            command=_delete_schedule
+        ).pack(side="left")
+
+        ttk.Button(
+            btn_row,
+            text="Cerrar",
+            command=win.destroy
+        ).pack(side="right")
 
     def _export_history_json(self):
         entries = self.history_manager.get_entries()

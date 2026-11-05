@@ -389,6 +389,36 @@ class TestQuarantineAndRestore(unittest.TestCase):
             self.assertEqual(eval_row["detected_mime"], "application/pdf")
             self.assertEqual(eval_row["integrity_status"], "VERIFIED")
 
+    def test_timeseries_and_scheduler_and_nuitka_spec(self):
+        """
+        Verifica:
+        1. Serie temporal analítica desde SQLite (`get_timeseries_points`) para matplotlib.
+        2. Generación de comando `schtasks` (Windows Task Scheduler API).
+        3. Especificación de compilación AOT con Nuitka (`get_nuitka_command`).
+        """
+        from datacleaner.scheduler import build_schtasks_create_command
+        from build_executable import get_nuitka_command
+
+        db_file = self.base_path / "ts_test.sqlite"
+        mgr = CleaningHistoryManager(storage_path=db_file)
+        mgr.record_event("QUARANTINE", str(self.base_path), 4, 10 * 1024 * 1024, "S1")
+        mgr.record_event("TRASH", str(self.base_path), 2, 5 * 1024 * 1024, "S2")
+
+        pts = mgr.get_timeseries_points()
+        self.assertEqual(len(pts), 2)
+        self.assertAlmostEqual(pts[1]["cumulative_mb"], 15.0, places=2)
+
+        sched_cmd = build_schtasks_create_command(self.base_path, schedule_type="WEEKLY", start_time="09:00")
+        self.assertIn("schtasks", sched_cmd)
+        self.assertIn("/Create", sched_cmd)
+        self.assertIn("WEEKLY", sched_cmd)
+
+        nuitka_cmd = get_nuitka_command()
+        self.assertIn("--standalone", nuitka_cmd)
+        self.assertIn("--onefile", nuitka_cmd)
+        self.assertIn("--windows-console-mode=disable", nuitka_cmd)
+        self.assertIn("--enable-plugin=tk-inter", nuitka_cmd)
+
 
 if __name__ == "__main__":
     unittest.main()

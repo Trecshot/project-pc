@@ -1,0 +1,6 @@
+{
+  "app_name": "DataCleaner",
+  "version": "1.0.0",
+  "engine": "Multi-Stage SHA-256 + SQLite3 + Magic Numbers",
+  "aot_compiler": "Nuitka"
+}
