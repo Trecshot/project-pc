@@ -3,9 +3,19 @@ DataCleaner - Gestor Local de Organización y Auditoría de Archivos por Hash
 """
 
 from datacleaner.security import validate_target_path, SYSTEM_BLACKLIST
-from datacleaner.hasher import compute_file_hash, compute_partial_hash
+from datacleaner.hasher import (
+    compute_file_hash,
+    compute_partial_hash,
+    compute_file_hash_async,
+    compute_partial_hash_async,
+)
+from datacleaner.bloom import BloomFilter
 from datacleaner.magic import analyze_file_signature, FileSignatureReport
-from datacleaner.scanner import scan_directory_for_duplicates, ScanSummary
+from datacleaner.scanner import (
+    scan_directory_for_duplicates,
+    scan_directory_async,
+    ScanSummary,
+)
 from datacleaner.rules import select_file_to_keep, KeepRule
 from datacleaner.quarantine import (
     quarantine_redundant_files,
@@ -49,9 +59,13 @@ __all__ = [
     "SYSTEM_BLACKLIST",
     "compute_file_hash",
     "compute_partial_hash",
+    "compute_file_hash_async",
+    "compute_partial_hash_async",
+    "BloomFilter",
     "analyze_file_signature",
     "FileSignatureReport",
     "scan_directory_for_duplicates",
+    "scan_directory_async",
     "ScanSummary",
     "select_file_to_keep",
     "KeepRule",

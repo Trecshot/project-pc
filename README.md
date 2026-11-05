@@ -8,9 +8,12 @@ DataCleaner es una herramienta de escritorio y consola (Windows 11 Fluent Design
 ## ✨ Lo Destacado
 
 - ⚡ **Multi-Stage Hashing (`O(1)` → `O(k)` → `O(n)`)**:
-  1. **Fase 1 (`st_size`)**: Agrupación instantánea por tamaño e inodos físicos (`st_ino`).
+  1. **Fase 1 (`st_size` + Bloom Filter en RAM)**: Agrupación instantánea por tamaño y descarte probabilístico $O(1)$ con huella de RAM casi nula (< 50 KB para millones de archivos).
   2. **Fase 2 (`Fast-Hash 128 KB`)**: Lectura exclusiva del primer y último bloque de `64 KB` (`MD5` + `seek`) para descartar falsas colisiones en archivos masivos (ISOs, contenedores, bases de datos) sin leer el archivo completo.
   3. **Fase 3 (`SHA-256`)**: Verificación criptográfica completa solo cuando los extremos colisionan.
+- 🚀 **Caché de Estado Hashed (Stateful Caching `O(1)`) & E/S Asíncrona**:
+  - Re-escaneos instantáneos: si el archivo no ha mutado (`st_mtime` y tamaño), su hash se recupera desde SQLite en $O(1)$ sin tocar el disco.
+  - Motor asíncrono con `asyncio` y `aiofiles` (`asyncio.Semaphore`) para exprimir el bus de lectura de discos SSD/NVMe sin contención del GIL.
 - 🔬 **Auditoría Forense por Firmas Binarias (`Magic Numbers`)**: Inspecciona las cabeceras hexadecimales reales (`%PDF`, `PNG`, `JPEG`, `ZIP`, `SQLite3`, ejecutables `MZ`/`ELF`) para detectar extensiones manipuladas o ejecutables camuflados como documentos.
 - 🔗 **4 Modos de Mitigación y Limpieza**:
   1. **Cuarentena Reversible (`Soft-Delete`)**: Aísla duplicados en `_quarantine_*/` con `manifest.json` para restaurar en un clic o vaciar/purgar sesiones cuando estés seguro.
@@ -59,12 +62,13 @@ python main.py purge "C:\MisDocumentos"
 
 ```text
 datacleaner/
-├── gui.py          # Interfaz Fluent Design Windows 11, Modal de Sesiones y Pestaña de Historial
-├── scanner.py      # Pipeline Multi-Stage (st_size -> Fast-Hash 64KB -> SHA-256)
-├── hasher.py       # Hashing parcial de extremos (MD5 seek) y SHA-256 por bloques
+├── gui.py          # Interfaz Fluent Design Windows 11, Gráfica Analítica y Tareas Programadas
+├── scanner.py      # Pipeline Multi-Stage Asíncrono (Bloom Filter -> Fast-Hash -> SHA-256)
+├── hasher.py       # Hashing parcial (MD5 seek) y SHA-256 síncrono/asíncrono (aiofiles)
+├── bloom.py        # Filtro de Bloom probabilístico optimizado en bytearray (RAM O(1))
 ├── magic.py        # Validación forense de cabeceras binarias (Magic Numbers / MIME)
 ├── quarantine.py   # Soft-Delete, Restauración, Purgado, Hardlinks OS-Level y Papelera
-├── history.py      # Persistencia SQLite (.datacleaner.sqlite) y conversión automática GB/MB
+├── history.py      # Persistencia SQLite (.datacleaner.sqlite), Stateful Cache y serie temporal
 ├── rules.py        # Reglas de conservación (profundidad, limpieza de ruta y fecha)
 └── security.py     # Protección estricta contra rutas críticas del sistema (Blacklist)
 ```
@@ -73,7 +77,7 @@ datacleaner/
 
 ## 🧪 Pruebas Automatizadas
 
-Cuenta con **34 pruebas unitarias** que validan seguridad, pipeline Multi-Stage, firmas Magic Numbers, hardlinks, ciclo de cuarentena/restauración y persistencia SQLite:
+Cuenta con **38 pruebas unitarias** que validan seguridad, pipeline Multi-Stage, firmas Magic Numbers, hardlinks, ciclo de cuarentena/restauración, Stateful Cache, Bloom Filters y E/S asíncrona:
 
 ```bash
 python -m pytest -v

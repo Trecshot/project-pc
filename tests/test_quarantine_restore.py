@@ -419,6 +419,85 @@ class TestQuarantineAndRestore(unittest.TestCase):
         self.assertIn("--windows-console-mode=disable", nuitka_cmd)
         self.assertIn("--enable-plugin=tk-inter", nuitka_cmd)
 
+    def test_bloom_filter_probabilistic_ram_optimization(self):
+        """
+        Mejora 2: Verifica que el Filtro de Bloom opere con cero falsos negativos
+        y mantenga una huella de memoria compacta para descarte preliminar.
+        """
+        from datacleaner.bloom import BloomFilter
+
+        bf = BloomFilter(expected_elements=1000, false_positive_rate=0.01)
+        sizes = [1024, 2048, 4096, 8192, 16384, 32768, 65536]
+        for s in sizes:
+            bf.add(s)
+
+        # Cero falsos negativos: todos los elementos insertados deben responder True
+        for s in sizes:
+            self.assertTrue(s in bf, f"Tamaño {s} debería estar presente en el Filtro de Bloom")
+
+        # Elemento claramente ausente
+        self.assertFalse(99999999 in bf)
+        self.assertGreater(bf.memory_bytes, 0)
+        self.assertLess(bf.memory_bytes, 50_000, "La huella de memoria debe ser minúscula")
+
+    def test_stateful_caching_sqlite(self):
+        """
+        Mejora 1: Verifica la Caché de Estado Hashed (Stateful Caching en SQLite O(1)).
+        Al re-escanear un directorio sin modificaciones, se reutilizan los hashes evitando lecturas de disco.
+        """
+        cache_dir = self.base_path / "StatefulCacheTest"
+        cache_dir.mkdir(parents=True)
+        f1 = cache_dir / "c1.bin"
+        f2 = cache_dir / "c2.bin"
+        data = b"Stateful Caching Payload Content 12345"
+        f1.write_bytes(data)
+        f2.write_bytes(data)
+
+        db_file = self.base_path / "cache_test.sqlite"
+        custom_mgr = CleaningHistoryManager(storage_path=db_file)
+
+        # Escaneo 1: Cache Miss inicial -> calcula y persiste en SQLite
+        dups1, sum1 = scan_directory_for_duplicates(cache_dir, history_manager=custom_mgr)
+        self.assertEqual(len(dups1), 1)
+        self.assertGreaterEqual(sum1.cache_misses, 2)
+
+        # Escaneo 2: Cache Hit -> recupera desde SQLite sin E/S repetitiva
+        dups2, sum2 = scan_directory_for_duplicates(cache_dir, history_manager=custom_mgr)
+        self.assertEqual(len(dups2), 1)
+        self.assertGreaterEqual(sum2.cache_hits, 2, "El segundo escaneo debe aprovechar los hashes en caché")
+
+    def test_asyncio_aiofiles_pipeline(self):
+        """
+        Mejora 3: Verifica la lectura y escaneo asíncrono no bloqueante con AsyncIO y aiofiles.
+        """
+        import asyncio
+        from datacleaner.hasher import (
+            compute_file_hash,
+            compute_partial_hash,
+            compute_file_hash_async,
+            compute_partial_hash_async,
+        )
+        from datacleaner.scanner import scan_directory_async
+
+        async_dir = self.base_path / "AsyncIOTest"
+        async_dir.mkdir(parents=True)
+        t_file = async_dir / "async_sample.dat"
+        payload = b"X" * 150000 + b"Y" * 150000
+        t_file.write_bytes(payload)
+
+        # Comparar hashes síncronos vs asíncronos bit a bit
+        sync_full = compute_file_hash(t_file)
+        async_full = asyncio.run(compute_file_hash_async(t_file))
+        self.assertEqual(sync_full, async_full)
+
+        sync_part = compute_partial_hash(t_file)
+        async_part = asyncio.run(compute_partial_hash_async(t_file))
+        self.assertEqual(sync_part, async_part)
+
+        # Ejecución directa del motor asíncrono scan_directory_async
+        dups, summary = asyncio.run(scan_directory_async(async_dir))
+        self.assertEqual(summary.total_files_scanned, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

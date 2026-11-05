@@ -122,6 +122,15 @@ ACTION_LABELS = {
 }
 
 
+class ManagedConnection(sqlite3.Connection):
+    """Conexión SQLite que asegura el cierre automático al salir del context manager (`with`)."""
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            super().__exit__(exc_type, exc_val, exc_tb)
+        finally:
+            self.close()
+
+
 class CleaningHistoryManager:
     """
     Gestor Transaccional SQLite (`.datacleaner.sqlite`) para el historial de operaciones
@@ -147,7 +156,7 @@ class CleaningHistoryManager:
 
     def _get_connection(self) -> sqlite3.Connection:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(self.db_path), timeout=10.0)
+        conn = sqlite3.connect(str(self.db_path), timeout=10.0, factory=ManagedConnection)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON;")
         return conn
@@ -156,6 +165,13 @@ class CleaningHistoryManager:
         """Ejecuta la creación condicional del esquema relacional en SQLite."""
         with self._get_connection() as conn:
             conn.execute("PRAGMA journal_mode = WAL;")
+
+            # Si la tabla de caché fue creada previamente con columnas INTEGER, recrearla con TEXT
+            cursor = conn.execute("PRAGMA table_info(file_hash_cache)")
+            cols = {row["name"]: str(row["type"]).upper() for row in cursor.fetchall()}
+            if cols.get("device_id") == "INTEGER" or cols.get("inode") == "INTEGER":
+                conn.execute("DROP TABLE IF EXISTS file_hash_cache;")
+
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS operations_history (
@@ -197,6 +213,22 @@ class CleaningHistoryManager:
                     action_taken TEXT NOT NULL DEFAULT 'KEEP',
                     FOREIGN KEY(session_id) REFERENCES sesiones_cuarentena(session_id) ON DELETE CASCADE
                 );
+
+                CREATE TABLE IF NOT EXISTS file_hash_cache (
+                    file_path TEXT PRIMARY KEY,
+                    device_id TEXT NOT NULL DEFAULT '',
+                    inode TEXT NOT NULL DEFAULT '',
+                    file_size INTEGER NOT NULL,
+                    mtime REAL NOT NULL,
+                    partial_hash TEXT,
+                    sha256_hash TEXT NOT NULL,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_cache_inode_mtime
+                    ON file_hash_cache(device_id, inode, mtime);
+                CREATE INDEX IF NOT EXISTS idx_cache_path_mtime
+                    ON file_hash_cache(file_path, mtime);
                 """
             )
             conn.commit()
@@ -235,6 +267,109 @@ class CleaningHistoryManager:
                 conn.commit()
         except Exception:
             pass
+
+    def get_cached_file_hash(
+        self,
+        file_path: Path | str,
+        device_id: int | str,
+        inode: int | str,
+        mtime: float,
+        file_size: int,
+    ) -> tuple[str | None, str | None]:
+        """
+        Consulta de Estado Diferencial en O(1):
+        Si el archivo coincide en (device_id, inode, mtime) o (file_path, mtime, file_size),
+        asume matemáticamente que el contenido es idéntico y devuelve (partial_hash, sha256_hash).
+        """
+        p_str = str(Path(file_path).resolve())
+        dev_str = str(device_id)
+        ino_str = str(inode)
+        with self._get_connection() as conn:
+            # 1. Búsqueda preferente por inodo y mtime si el inodo es válido y no vacío
+            if ino_str and ino_str != "0":
+                row = conn.execute(
+                    """
+                    SELECT partial_hash, sha256_hash, file_size, mtime
+                    FROM file_hash_cache
+                    WHERE device_id = ? AND inode = ?
+                    LIMIT 1
+                    """,
+                    (dev_str, ino_str),
+                ).fetchone()
+                if row and abs(float(row["mtime"]) - float(mtime)) < 1e-4 and int(row["file_size"]) == file_size:
+                    return row["partial_hash"], row["sha256_hash"]
+
+            # 2. Búsqueda alternativa por ruta canónica y mtime
+            row = conn.execute(
+                """
+                SELECT partial_hash, sha256_hash, file_size, mtime
+                FROM file_hash_cache
+                WHERE file_path = ?
+                LIMIT 1
+                """,
+                (p_str,),
+            ).fetchone()
+            if row and abs(float(row["mtime"]) - float(mtime)) < 1e-4 and int(row["file_size"]) == file_size:
+                return row["partial_hash"], row["sha256_hash"]
+
+        return None, None
+
+    def set_cached_file_hash(
+        self,
+        file_path: Path | str,
+        device_id: int | str,
+        inode: int | str,
+        mtime: float,
+        file_size: int,
+        partial_hash: str | None,
+        sha256_hash: str,
+    ) -> None:
+        """Guarda o actualiza el estado de hash de un archivo en la caché de SQLite."""
+        p_str = str(Path(file_path).resolve())
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO file_hash_cache
+                (file_path, device_id, inode, file_size, mtime, partial_hash, sha256_hash, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                (
+                    p_str,
+                    str(device_id),
+                    str(inode),
+                    file_size,
+                    float(mtime),
+                    partial_hash,
+                    sha256_hash,
+                ),
+            )
+            conn.commit()
+
+    def set_cached_hashes_batch(self, records: list[dict[str, Any]]) -> None:
+        """Inserción por lote para minimizar transacciones en escaneos masivos."""
+        if not records:
+            return
+        with self._get_connection() as conn:
+            conn.executemany(
+                """
+                INSERT OR REPLACE INTO file_hash_cache
+                (file_path, device_id, inode, file_size, mtime, partial_hash, sha256_hash, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                [
+                    (
+                        str(r["file_path"]),
+                        str(r.get("device_id", "")),
+                        str(r.get("inode", "")),
+                        int(r["file_size"]),
+                        float(r["mtime"]),
+                        r.get("partial_hash"),
+                        str(r["sha256_hash"]),
+                    )
+                    for r in records
+                ],
+            )
+            conn.commit()
 
     def record_audit_session(
         self,
@@ -447,6 +582,12 @@ class CleaningHistoryManager:
             })
         return points
 
+    def clear_hash_cache(self) -> None:
+        """Limpia la tabla de caché persistente de hashes."""
+        with self._get_connection() as conn:
+            conn.execute("DELETE FROM file_hash_cache;")
+            conn.commit()
+
     def clear_history(self) -> None:
         with self._get_connection() as conn:
             conn.executescript(
@@ -454,6 +595,7 @@ class CleaningHistoryManager:
                 DELETE FROM operations_history;
                 DELETE FROM archivos_evaluados;
                 DELETE FROM sesiones_cuarentena;
+                DELETE FROM file_hash_cache;
                 """
             )
             conn.commit()

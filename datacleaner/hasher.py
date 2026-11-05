@@ -13,8 +13,15 @@ control riguroso de concurrencia y manejo seguro de excepciones por archivos blo
 
 import hashlib
 import os
+import asyncio
 from pathlib import Path
 from typing import Callable
+
+try:
+    import aiofiles
+    HAS_AIOFILES = True
+except ImportError:
+    HAS_AIOFILES = False
 
 try:
     import xxhash
@@ -108,4 +115,58 @@ def compute_file_hash(
         # Manejo no destructivo: registra la advertencia y continúa con el siguiente archivo
         if on_error:
             on_error(f"No se pudo leer '{file_path}': {exc}")
+        return None
+
+
+async def compute_partial_hash_async(
+    file_path: Path,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    on_error: Callable[[str], None] | None = None
+) -> str | None:
+    """
+    Fase 2 Asíncrona (AsyncIO + aiofiles):
+    Calcula el hash preliminar rápido leyendo solo los extremos del archivo sin bloquear el Event Loop.
+    """
+    fast_hash = hashlib.md5()
+    try:
+        file_size = file_path.stat().st_size
+        if HAS_AIOFILES:
+            async with aiofiles.open(file_path, "rb") as f:
+                first_chunk = await f.read(chunk_size)
+                fast_hash.update(first_chunk)
+                if file_size > chunk_size * 2:
+                    await f.seek(-chunk_size, os.SEEK_END)
+                    last_chunk = await f.read(chunk_size)
+                    fast_hash.update(last_chunk)
+            return fast_hash.hexdigest()
+        else:
+            return await asyncio.to_thread(compute_partial_hash, file_path, chunk_size, on_error)
+    except (PermissionError, OSError, FileNotFoundError, IOError) as exc:
+        if on_error:
+            on_error(f"Error en lectura parcial async de '{file_path}': {exc}")
+        return None
+
+
+async def compute_file_hash_async(
+    file_path: Path,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    on_error: Callable[[str], None] | None = None
+) -> str | None:
+    """
+    Fase 3 Asíncrona (AsyncIO + aiofiles):
+    Calcula el SHA-256 criptográfico completo liberando el Event Loop mientras el disco gira/lee,
+    maximizando el ancho de banda del bus de almacenamiento (SSD/NVMe).
+    """
+    sha256_hash = hashlib.sha256()
+    try:
+        if HAS_AIOFILES:
+            async with aiofiles.open(file_path, "rb") as f:
+                while chunk := await f.read(chunk_size):
+                    sha256_hash.update(chunk)
+            return sha256_hash.hexdigest()
+        else:
+            return await asyncio.to_thread(compute_file_hash, file_path, chunk_size, on_error)
+    except (PermissionError, OSError, FileNotFoundError, IOError) as exc:
+        if on_error:
+            on_error(f"No se pudo leer '{file_path}' (async): {exc}")
         return None

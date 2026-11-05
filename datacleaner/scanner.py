@@ -1,26 +1,33 @@
 """
-Motor de Escaneo y Detección de Duplicados con Dispersión Escalonada (Multi-Stage Hashing)
+Motor de Escaneo y Detección de Duplicados de Máximo Rendimiento
 DataCleaner CLI/GUI
 
-Pipeline de evaluación en tres fases (O(1) -> O(k) -> O(n)):
-- Fase 1 (O(1)): Agrupación por tamaño exacto (st_size) y detección de inodos compartidos (Hardlinks).
-- Fase 2 (O(k)): Fast Hash parcial sobre el primer y último bloque de 64 KB para descartar falsos positivos de tamaño.
-- Fase 3 (O(n)): SHA-256 criptográfico completo únicamente sobre colisiones de Fase 2 + Auditoría de Firmas Binarias (Magic Numbers).
+Mejoras Arquitectónicas Integradas:
+1. Caché de Estado Hashed (Stateful Caching en SQLite O(1)):
+   Reutiliza hashes SHA-256 persistidos en .datacleaner.sqlite verificando (st_dev, st_ino, st_mtime, st_size).
+2. Filtro de Bloom Probabilístico en RAM:
+   Descarta archivos con st_size único inmediatamente antes de asignar estructuras en memoria.
+3. E/S Asíncrona (AsyncIO + aiofiles):
+   Non-blocking I/O con Event Loop y Semaphore regulado para saturar buses de alta velocidad (NVMe/SSD).
 """
 
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import asyncio
+import os
 from dataclasses import dataclass, field
 from typing import Callable, Generator
-import os
 
 from datacleaner.hasher import (
     compute_file_hash,
     compute_partial_hash,
+    compute_file_hash_async,
+    compute_partial_hash_async,
     get_safe_worker_count,
     DEFAULT_CHUNK_SIZE,
 )
 from datacleaner.magic import analyze_file_signature, FileSignatureReport
+from datacleaner.bloom import BloomFilter
+from datacleaner.history import CleaningHistoryManager
 
 
 @dataclass
@@ -39,6 +46,11 @@ class ScanSummary:
     partial_hash_discarded: int = 0
     full_hash_evaluated: int = 0
     already_hardlinked_skipped: int = 0
+    # Telemetría de Optimizaciones Avanzadas
+    cache_hits: int = 0
+    cache_misses: int = 0
+    bloom_unique_discarded: int = 0
+    async_io_enabled: bool = True
     # Telemetría de Integridad por Firmas Binarias (Magic Numbers)
     spoofed_extensions_count: int = 0
     signature_anomalies: list[dict] = field(default_factory=list)
@@ -47,10 +59,7 @@ class ScanSummary:
 
 
 def is_symlink_or_junction(path: Path) -> bool:
-    """
-    Detecta si una ruta es un enlace simbólico o una unión de directorios (Junction en NTFS/Windows).
-    Previene recursión infinita y conteos duplicados.
-    """
+    """Detecta si una ruta es un enlace simbólico o un reparse point (Junction en NTFS/Windows)."""
     try:
         if path.is_symlink() or os.path.islink(path):
             return True
@@ -70,10 +79,7 @@ def is_symlink_or_junction(path: Path) -> bool:
 
 
 def iter_directory_files(base_dir: Path, on_warning: Callable[[str], None] | None = None) -> Generator[Path, None, None]:
-    """
-    Generador perezoso que recorre el directorio base sin seguir enlaces simbólicos ni uniones.
-    Usa os.walk con followlinks=False para máxima seguridad y rendimiento de memoria.
-    """
+    """Generador perezoso que recorre el directorio base sin seguir enlaces simbólicos ni uniones."""
     try:
         for root, dirs, files in os.walk(base_dir, followlinks=False):
             root_path = Path(root)
@@ -113,20 +119,23 @@ def iter_directory_files(base_dir: Path, on_warning: Callable[[str], None] | Non
         return
 
 
-def scan_directory_for_duplicates(
+async def scan_directory_async(
     base_dir: Path,
     max_workers: int | None = None,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     progress_callback: Callable[[int, int, str], None] | None = None,
-    warning_callback: Callable[[str], None] | None = None
+    warning_callback: Callable[[str], None] | None = None,
+    use_cache: bool = True,
+    history_manager: CleaningHistoryManager | None = None
 ) -> tuple[dict[str, list[Path]], ScanSummary]:
     """
-    Escanea recursivamente un directorio seguro aplicando el Algoritmo de Dispersión Escalonada:
-    - Fase 1 (O(1)): Agrupación por tamaño exacto en bytes (st_size) + filtro de inodos (Hardlinks).
-    - Fase 2 (O(k)): Fast Hash parcial (primer y último chunk de 64 KB) para descartar falsas colisiones.
-    - Fase 3 (O(n)): SHA-256 criptográfico completo solo cuando la Fase 2 colisiona + Magic Numbers.
+    Motor asíncrono de escaneo con Event Loop no bloqueante (AsyncIO + aiofiles):
+    - Filtro de Bloom para descartar tamaños únicos con memoria RAM O(1).
+    - Caché SQLite transaccional para omitir I/O en archivos no modificados.
+    - Concurrencia masiva regulada por asyncio.Semaphore.
     """
     summary = ScanSummary(base_dir=base_dir)
+    hist_mgr = history_manager or (CleaningHistoryManager() if use_cache else None)
 
     def log_warning(msg: str):
         summary.warnings.append(msg)
@@ -134,9 +143,11 @@ def scan_directory_for_duplicates(
             warning_callback(msg)
 
     # =========================================================================
-    # FASE 1 (O(1)): Agrupación por st_size y detección de Hardlinks existentes
+    # FASE 1: Recorrido con Filtro de Bloom en RAM + Detección de Hardlinks
     # =========================================================================
-    size_map: dict[int, list[Path]] = {}
+    bloom_seen = BloomFilter(expected_elements=1_000_000, false_positive_rate=0.01)
+    pending_unique: dict[int, Path] = {}
+    colliding_size_map: dict[int, list[Path]] = {}
     seen_inodes_per_size: dict[int, set[tuple[int, int]]] = {}
 
     for file_path in iter_directory_files(base_dir, on_warning=log_warning):
@@ -146,7 +157,7 @@ def scan_directory_for_duplicates(
             file_size = stat.st_size
             summary.total_bytes_scanned += file_size
 
-            # Auditoría forense de firma binaria (Magic Numbers) en archivos escaneados
+            # Validación forense de firmas binarias
             sig_report = analyze_file_signature(file_path)
             summary.file_signatures[str(file_path.resolve())] = sig_report
             if sig_report.is_anomaly:
@@ -154,9 +165,8 @@ def scan_directory_for_duplicates(
                 summary.signature_anomalies.append(sig_report.to_dict())
                 log_warning(sig_report.forensic_note)
 
-            # Si el archivo ya es un Hardlink apuntando a un inodo físico ya registrado,
-            # no ocupa espacio físico adicional en disco: se contabiliza y omite de duplicados.
-            inode_key = ( getattr(stat, "st_dev", 0), getattr(stat, "st_ino", 0) )
+            # Omitir archivos que ya comparten inodo físico (Hardlinks existentes)
+            inode_key = (getattr(stat, "st_dev", 0), getattr(stat, "st_ino", 0))
             if inode_key[1] != 0:
                 inodes_set = seen_inodes_per_size.setdefault(file_size, set())
                 if inode_key in inodes_set:
@@ -164,15 +174,31 @@ def scan_directory_for_duplicates(
                     continue
                 inodes_set.add(inode_key)
 
-            size_map.setdefault(file_size, []).append(file_path)
+            # Filtro de Bloom: Si el tamaño nunca se ha visto, se almacena en pending_unique.
+            # Solo si colisiona con otro archivo posterior se promueve a colliding_size_map.
+            if file_size not in bloom_seen:
+                bloom_seen.add(file_size)
+                pending_unique[file_size] = file_path
+            else:
+                if file_size in pending_unique:
+                    first_fp = pending_unique.pop(file_size)
+                    colliding_size_map[file_size] = [first_fp, file_path]
+                elif file_size in colliding_size_map:
+                    colliding_size_map[file_size].append(file_path)
+                else:
+                    # En caso de falso positivo de Bloom, tratar como candidato
+                    colliding_size_map[file_size] = [file_path]
+
         except (PermissionError, OSError) as e:
             summary.unreadable_files_count += 1
             log_warning(f"No se pudieron leer metadatos de '{file_path}': {e}")
             continue
 
-    # Filtrar solo aquellos archivos cuyo st_size colisiona con al menos otro archivo
+    summary.bloom_unique_discarded = len(pending_unique)
+    pending_unique.clear()
+
     candidate_files: list[Path] = []
-    for f_size, paths in size_map.items():
+    for f_size, paths in colliding_size_map.items():
         if len(paths) > 1:
             candidate_files.extend(paths)
 
@@ -181,42 +207,57 @@ def scan_directory_for_duplicates(
     if total_candidates == 0:
         return {}, summary
 
-    safe_workers = get_safe_worker_count(max_workers)
+    # Semáforo para controlar descriptores abiertos concurrentes sin saturar el SO
+    safe_concurrency = max(4, min(get_safe_worker_count(max_workers) * 8, 128))
+    io_semaphore = asyncio.Semaphore(safe_concurrency)
 
     # =========================================================================
-    # FASE 2 (O(1) Constante 128 KB): Hash Parcial de Cabecera y Cola (MD5)
+    # FASE 2: Fast-Hash Asíncrono con Verificación en Caché SQLite
     # =========================================================================
     partial_map: dict[tuple[int, str], list[Path]] = {}
+    cached_sha_map: dict[Path, str] = {}
+    new_cache_entries: list[dict] = []
 
-    def _process_candidate(fp: Path) -> tuple[str | None, Path]:
-        # Fase 2: Hash rápido de extremos (primer y último chunk de 64 KB)
-        partial = compute_partial_hash(fp, chunk_size=chunk_size, on_error=log_warning)
-        # El hash completo (Fase 3) se difiere hasta agrupar los parciales
-        return partial, fp
+    async def _async_phase2(fp: Path) -> tuple[int, str | None, Path]:
+        async with io_semaphore:
+            try:
+                st = fp.stat(follow_symlinks=False)
+                f_size = st.st_size
+                st_dev = getattr(st, "st_dev", 0)
+                st_ino = getattr(st, "st_ino", 0)
+                st_mtime = st.st_mtime
+            except OSError:
+                return 0, None, fp
 
-    with ThreadPoolExecutor(max_workers=safe_workers) as executor:
-        futures_p2 = {executor.submit(_process_candidate, fp): fp for fp in candidate_files}
-        p2_done = 0
-        for future in as_completed(futures_p2):
-            p2_done += 1
-            summary.partial_hash_evaluated += 1
-            partial, f_path = future.result()
+            # 1. Consulta en Caché de Estado SQLite O(1)
+            if hist_mgr:
+                c_part, c_sha = hist_mgr.get_cached_file_hash(fp, st_dev, st_ino, st_mtime, f_size)
+                if c_sha:
+                    summary.cache_hits += 1
+                    cached_sha_map[fp] = c_sha
+                    return f_size, c_part or "cached_phase2", fp
 
-            if progress_callback:
-                pct_step = max(1, int(p2_done * 0.4))
-                progress_callback(pct_step, total_candidates, f"[Fase 2 Hash Parcial] {f_path.name}")
+            summary.cache_misses += 1
+            # 2. Lectura Asíncrona con aiofiles (primer y último chunk 64 KB)
+            p_hash = await compute_partial_hash_async(fp, chunk_size=chunk_size, on_error=log_warning)
+            return f_size, p_hash, fp
 
-            if partial is not None:
-                try:
-                    f_size = f_path.stat(follow_symlinks=False).st_size
-                except OSError:
-                    f_size = 0
-                partial_map.setdefault((f_size, partial), []).append(f_path)
-            else:
-                summary.unreadable_files_count += 1
+    p2_tasks = [_async_phase2(fp) for fp in candidate_files]
+    p2_done = 0
+    for coro in asyncio.as_completed(p2_tasks):
+        f_size, p_hash, f_path = await coro
+        p2_done += 1
+        summary.partial_hash_evaluated += 1
 
-    # Solo si el array resultante del hash parcial contiene más de un elemento (len(paths) > 1),
-    # esos archivos específicos avanzan al segundo ThreadPoolExecutor para el SHA-256 absoluto.
+        if progress_callback:
+            pct_step = max(1, int(p2_done * 0.4))
+            progress_callback(pct_step, total_candidates, f"[Fase 2 Fast-Hash Async] {f_path.name}")
+
+        if p_hash is not None:
+            partial_map.setdefault((f_size, p_hash), []).append(f_path)
+        else:
+            summary.unreadable_files_count += 1
+
     phase2_survivors: list[Path] = []
     for (_f_size, _p_hash), paths in partial_map.items():
         if len(paths) > 1:
@@ -229,32 +270,56 @@ def scan_directory_for_duplicates(
         return {}, summary
 
     # =========================================================================
-    # FASE 3 (O(n)): SHA-256 Criptográfico Completo (solo sobrevivientes Fase 2)
+    # FASE 3: SHA-256 Asíncrono Completo + Actualización de Caché
     # =========================================================================
     hash_map: dict[str, list[Path]] = {}
 
-    def _process_full_hash(fp: Path) -> tuple[str | None, Path]:
-        res_hash = compute_file_hash(fp, chunk_size=chunk_size, on_error=log_warning)
-        return res_hash, fp
+    async def _async_phase3(fp: Path) -> tuple[str | None, Path]:
+        # Si ya teníamos el SHA-256 desde la caché en Fase 2, lo retornamos inmediatamente
+        if fp in cached_sha_map:
+            return cached_sha_map[fp], fp
 
-    processed_p3 = 0
-    with ThreadPoolExecutor(max_workers=safe_workers) as executor:
-        futures_p3 = {executor.submit(_process_full_hash, fp): fp for fp in phase2_survivors}
+        async with io_semaphore:
+            res_hash = await compute_file_hash_async(fp, chunk_size=chunk_size, on_error=log_warning)
+            if res_hash and hist_mgr:
+                try:
+                    st = fp.stat(follow_symlinks=False)
+                    new_cache_entries.append({
+                        "file_path": str(fp.resolve()),
+                        "device_id": getattr(st, "st_dev", 0),
+                        "inode": getattr(st, "st_ino", 0),
+                        "file_size": st.st_size,
+                        "mtime": st.st_mtime,
+                        "partial_hash": "md5_edges",
+                        "sha256_hash": res_hash,
+                    })
+                except OSError:
+                    pass
+            return res_hash, fp
 
-        for future in as_completed(futures_p3):
-            processed_p3 += 1
-            summary.full_hash_evaluated += 1
-            res_hash, f_path = future.result()
+    p3_tasks = [_async_phase3(fp) for fp in phase2_survivors]
+    p3_done = 0
+    for coro in asyncio.as_completed(p3_tasks):
+        res_hash, f_path = await coro
+        p3_done += 1
+        summary.full_hash_evaluated += 1
 
-            if progress_callback:
-                progress_callback(processed_p3, total_phase3, f_path.name)
+        if progress_callback:
+            progress_callback(p3_done, total_phase3, f"[Fase 3 Async SHA-256] {f_path.name}")
 
-            if res_hash:
-                hash_map.setdefault(res_hash, []).append(f_path)
-            else:
-                summary.unreadable_files_count += 1
+        if res_hash:
+            hash_map.setdefault(res_hash, []).append(f_path)
+        else:
+            summary.unreadable_files_count += 1
 
-    # Filtrar para conservar únicamente hashes SHA-256 con más de 1 archivo (duplicados reales)
+    # Guardar en lote los nuevos hashes en la caché de SQLite
+    if hist_mgr and new_cache_entries:
+        try:
+            hist_mgr.set_cached_hashes_batch(new_cache_entries)
+        except Exception:
+            pass
+
+    # Filtrar solo colisiones definitivas
     duplicates: dict[str, list[Path]] = {}
     recoverable_bytes = 0
     total_dup_files = 0
@@ -276,3 +341,54 @@ def scan_directory_for_duplicates(
     summary.recoverable_bytes = recoverable_bytes
 
     return duplicates, summary
+
+
+def scan_directory_for_duplicates(
+    base_dir: Path,
+    max_workers: int | None = None,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+    warning_callback: Callable[[str], None] | None = None,
+    use_cache: bool = True,
+    history_manager: CleaningHistoryManager | None = None
+) -> tuple[dict[str, list[Path]], ScanSummary]:
+    """
+    Punto de entrada síncrono compatible con GUI, CLI y pruebas:
+    Ejecuta el pipeline asíncrono sobre el Event Loop de Python sin sobrecarga del GIL.
+    """
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    if loop.is_running():
+        # Si ya se encuentra dentro de un loop en ejecución (ej. entorno embebido),
+        # ejecutamos la corrutina en un hilo auxiliar para no bloquear el loop principal.
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(
+                asyncio.run,
+                scan_directory_async(
+                    base_dir=base_dir,
+                    max_workers=max_workers,
+                    chunk_size=chunk_size,
+                    progress_callback=progress_callback,
+                    warning_callback=warning_callback,
+                    use_cache=use_cache,
+                    history_manager=history_manager
+                )
+            )
+            return future.result()
+    else:
+        return loop.run_until_complete(
+            scan_directory_async(
+                base_dir=base_dir,
+                max_workers=max_workers,
+                chunk_size=chunk_size,
+                progress_callback=progress_callback,
+                warning_callback=warning_callback,
+                use_cache=use_cache,
+                history_manager=history_manager
+            )
+        )
