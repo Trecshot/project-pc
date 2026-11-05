@@ -57,44 +57,23 @@ def compute_partial_hash(
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     on_error: Callable[[str], None] | None = None
 ) -> str | None:
-    """
-    Fase 2 (O(k)) del Algoritmo de Dispersión Escalonada (Multi-Stage Hashing):
-    Calcula un Fast Hash exclusivamente sobre el primer y el último fragmento (chunk)
-    de 64 KB del archivo. Si difieren entre archivos del mismo tamaño, se descarta
-    la colisión de inmediato sin leer el resto de archivos masivos (ISOs, contenedores, BDs).
-
-    Args:
-        file_path: Ruta al archivo candidato.
-        chunk_size: Tamaño del fragmento inicial y final (64 KB por defecto).
-        on_error: Callback opcional para registrar errores de lectura.
-
-    Returns:
-        Hexdigest del hash parcial de bordes, o None si el archivo no pudo leerse.
-    """
-    fast_hasher = _new_fast_hasher()
+    """Calcula un hash preliminar rápido leyendo solo los extremos del archivo."""
+    fast_hash = hashlib.md5()  # MD5 es más veloz y suficiente para descarte preliminar
     try:
-        file_size = file_path.stat(follow_symlinks=False).st_size
-        fast_hasher.update(file_size.to_bytes(8, byteorder="little", signed=False))
-
+        file_size = file_path.stat().st_size
         with open(file_path, "rb") as f:
-            if file_size <= chunk_size * 2:
-                # Si el archivo mide <= 128 KB, una sola lectura cubre ambos extremos
-                data = f.read(chunk_size * 2)
-                fast_hasher.update(data)
-            else:
-                # Leer primer fragmento de 64 KB (cabecera)
-                first_chunk = f.read(chunk_size)
-                fast_hasher.update(first_chunk)
+            # 1. Leer cabecera (Magic Numbers y primeros metadatos)
+            fast_hash.update(f.read(chunk_size))
 
-                # Saltar en O(1) al último fragmento de 64 KB (cola)
-                f.seek(file_size - chunk_size, os.SEEK_SET)
-                last_chunk = f.read(chunk_size)
-                fast_hasher.update(last_chunk)
+            # 2. Leer cola (Firmas de cierre y EOF)
+            if file_size > chunk_size * 2:
+                f.seek(-chunk_size, os.SEEK_END)
+                fast_hash.update(f.read(chunk_size))
 
-        return fast_hasher.hexdigest()
+        return fast_hash.hexdigest()
     except (PermissionError, OSError, FileNotFoundError, IOError) as exc:
         if on_error:
-            on_error(f"No se pudo calcular Fast-Hash parcial de '{file_path}': {exc}")
+            on_error(f"Error en lectura parcial de '{file_path}': {exc}")
         return None
 
 

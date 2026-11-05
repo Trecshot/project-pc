@@ -2,14 +2,9 @@
 Subsistema de Persistencia Transaccional en SQLite e Historial de Memoria Recuperada
 DataCleaner CLI/GUI
 
-Migra el almacenamiento de auditoría e historial desde JSON plano hacia una base de datos
-relacional local en SQLite con modo WAL (Write-Ahead Logging) para concurrencia segura
-y consultas agregadas en tiempo O(log N) sin cargar todo el historial en memoria RAM (RNF-01).
-
-Esquema relacional normalizado:
-1. Tabla `sesiones_cuarentena`: Registro de sesiones de auditoría, aislamiento y su estado.
-2. Tabla `archivos_evaluados`: Detalle forense por archivo (SHA-256, Fast-Hash, MIME real, integridad).
-3. Tabla `metricas_recuperacion`: Eventos de recuperación de espacio (Cuarentena, Hardlink, Papelera, Purga, Restauración).
+Reemplaza el motor de persistencia plano JSON por el módulo estándar sqlite3
+(`.datacleaner.sqlite`), manteniendo intacta la interfaz de `CleaningHistoryManager`
+para conservar el acoplamiento con `gui.py` y `cli.py`.
 """
 
 from pathlib import Path
@@ -20,7 +15,8 @@ import sqlite3
 import json
 
 
-DEFAULT_SQLITE_DB = Path(__file__).resolve().parent.parent / ".datacleaner_audit.db"
+DEFAULT_DATABASE = Path(__file__).resolve().parent.parent / ".datacleaner.sqlite"
+DEFAULT_HISTORY_FILE = DEFAULT_DATABASE
 LEGACY_JSON_HISTORY = Path(__file__).resolve().parent.parent / ".datacleaner_history.json"
 
 
@@ -47,7 +43,6 @@ def format_bytes_auto(bytes_count: int | float, target_unit: str = "AUTO") -> st
         else:
             return f"{val:.4f} {target_upper}"
 
-    # Modo AUTO: escala automáticamente a la siguiente unidad (KB -> MB -> GB -> TB) al llegar a 1000
     val = float(bytes_count)
     unit_idx = 0
     while val >= 1000.0 and unit_idx < len(units) - 1:
@@ -129,23 +124,22 @@ ACTION_LABELS = {
 
 class CleaningHistoryManager:
     """
-    Gestor Transaccional SQLite para auditoría forense, sesiones de cuarentena,
-    archivos evaluados y métricas de recuperación de memoria en O(log N).
+    Gestor Transaccional SQLite (`.datacleaner.sqlite`) para el historial de operaciones
+    (`operations_history`), sesiones de cuarentena y métricas agregadas en C.
     """
 
     def __init__(self, history_file: Path | str | None = None, storage_path: Path | str | None = None):
         chosen = history_file or storage_path
         if chosen:
             chosen_path = Path(chosen).resolve()
-            # Si un test o llamador pasa una ruta .json, usamos un archivo .db SQLite asociado
             if chosen_path.suffix.lower() == ".json":
-                self.db_path = chosen_path.with_suffix(".db")
+                self.db_path = chosen_path.with_suffix(".sqlite")
                 self.legacy_json_path = chosen_path
             else:
                 self.db_path = chosen_path
                 self.legacy_json_path = None
         else:
-            self.db_path = DEFAULT_SQLITE_DB
+            self.db_path = DEFAULT_DATABASE
             self.legacy_json_path = LEGACY_JSON_HISTORY
 
         self._init_database()
@@ -159,11 +153,27 @@ class CleaningHistoryManager:
         return conn
 
     def _init_database(self) -> None:
-        """Crea las 3 tablas normalizadas (`sesiones_cuarentena`, `archivos_evaluados`, `metricas_recuperacion`) e índices B-Tree."""
+        """Ejecuta la creación condicional del esquema relacional en SQLite."""
         with self._get_connection() as conn:
             conn.execute("PRAGMA journal_mode = WAL;")
             conn.executescript(
                 """
+                CREATE TABLE IF NOT EXISTS operations_history (
+                    entry_id TEXT PRIMARY KEY,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    action_type TEXT NOT NULL,
+                    action_label TEXT NOT NULL,
+                    target_dir TEXT NOT NULL,
+                    files_count INTEGER NOT NULL,
+                    bytes_count INTEGER NOT NULL,
+                    details TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_operations_timestamp
+                    ON operations_history(timestamp DESC);
+                CREATE INDEX IF NOT EXISTS idx_operations_action
+                    ON operations_history(action_type);
+
                 CREATE TABLE IF NOT EXISTS sesiones_cuarentena (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     session_id TEXT UNIQUE NOT NULL,
@@ -174,11 +184,6 @@ class CleaningHistoryManager:
                     files_count INTEGER NOT NULL DEFAULT 0,
                     bytes_isolated INTEGER NOT NULL DEFAULT 0
                 );
-
-                CREATE INDEX IF NOT EXISTS idx_sesiones_timestamp
-                    ON sesiones_cuarentena(timestamp DESC);
-                CREATE INDEX IF NOT EXISTS idx_sesiones_base_dir
-                    ON sesiones_cuarentena(base_dir);
 
                 CREATE TABLE IF NOT EXISTS archivos_evaluados (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -192,52 +197,27 @@ class CleaningHistoryManager:
                     action_taken TEXT NOT NULL DEFAULT 'KEEP',
                     FOREIGN KEY(session_id) REFERENCES sesiones_cuarentena(session_id) ON DELETE CASCADE
                 );
-
-                CREATE INDEX IF NOT EXISTS idx_archivos_session
-                    ON archivos_evaluados(session_id);
-                CREATE INDEX IF NOT EXISTS idx_archivos_sha256
-                    ON archivos_evaluados(sha256_hash);
-                CREATE INDEX IF NOT EXISTS idx_archivos_integrity
-                    ON archivos_evaluados(integrity_status);
-
-                CREATE TABLE IF NOT EXISTS metricas_recuperacion (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    entry_id TEXT UNIQUE NOT NULL,
-                    timestamp TEXT NOT NULL,
-                    action_type TEXT NOT NULL,
-                    action_label TEXT NOT NULL,
-                    target_dir TEXT NOT NULL,
-                    files_count INTEGER NOT NULL DEFAULT 0,
-                    bytes_count INTEGER NOT NULL DEFAULT 0,
-                    details TEXT NOT NULL DEFAULT ''
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_metricas_timestamp
-                    ON metricas_recuperacion(timestamp DESC, id DESC);
-                CREATE INDEX IF NOT EXISTS idx_metricas_action
-                    ON metricas_recuperacion(action_type);
                 """
             )
             conn.commit()
 
     def _migrate_legacy_json_if_needed(self) -> None:
-        """Migra automáticamente el archivo histórico JSON previo a la tabla SQLite si existiera."""
+        """Migra entradas previas de `.datacleaner_history.json` si existiera."""
         if not self.legacy_json_path or not self.legacy_json_path.exists():
             return
         try:
             with self._get_connection() as conn:
-                row = conn.execute("SELECT COUNT(*) AS cnt FROM metricas_recuperacion").fetchone()
+                row = conn.execute("SELECT COUNT(*) AS cnt FROM operations_history").fetchone()
                 if row and row["cnt"] > 0:
                     return
 
                 with open(self.legacy_json_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 raw_entries = data.get("entries", [])
-                # Insertar desde el más antiguo al más reciente para preservar el orden de IDs
                 for item in reversed(raw_entries):
                     conn.execute(
                         """
-                        INSERT OR IGNORE INTO metricas_recuperacion
+                        INSERT OR IGNORE INTO operations_history
                         (entry_id, timestamp, action_type, action_label, target_dir, files_count, bytes_count, details)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         """,
@@ -266,10 +246,6 @@ class CleaningHistoryManager:
         bytes_isolated: int,
         evaluated_files: list[dict[str, Any]] | None = None
     ) -> None:
-        """
-        Registra transaccionalmente una sesión en `sesiones_cuarentena` y sus archivos
-        auditados en `archivos_evaluados`.
-        """
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with self._get_connection() as conn:
             conn.execute(
@@ -312,7 +288,6 @@ class CleaningHistoryManager:
             conn.commit()
 
     def update_quarantine_session_status(self, session_id: str, new_status: str) -> None:
-        """Actualiza el estado de una sesión en `sesiones_cuarentena` (ej. RESTORED, PURGED)."""
         with self._get_connection() as conn:
             conn.execute(
                 "UPDATE sesiones_cuarentena SET status = ? WHERE session_id = ?",
@@ -320,21 +295,14 @@ class CleaningHistoryManager:
             )
             conn.commit()
 
-    def get_entries(self, limit: int = 500) -> list[HistoryEntry]:
-        return self.load_entries(limit=limit)
+    def get_entries(self) -> list[HistoryEntry]:
+        return self.load_entries()
 
-    def load_entries(self, limit: int = 500) -> list[HistoryEntry]:
-        """Consulta paginada en O(log N) desde `metricas_recuperacion` sin saturar RAM."""
+    def load_entries(self) -> list[HistoryEntry]:
+        """Consulta directa sobre `operations_history` ordenada por timestamp DESC."""
         with self._get_connection() as conn:
             rows = conn.execute(
-                """
-                SELECT entry_id, timestamp, action_type, action_label,
-                       target_dir, files_count, bytes_count, details
-                FROM metricas_recuperacion
-                ORDER BY id DESC
-                LIMIT ?
-                """,
-                (limit,)
+                "SELECT * FROM operations_history ORDER BY timestamp DESC, rowid DESC"
             ).fetchall()
 
         return [
@@ -346,7 +314,7 @@ class CleaningHistoryManager:
                 target_dir=r["target_dir"],
                 files_count=r["files_count"],
                 bytes_count=r["bytes_count"],
-                details=r["details"],
+                details=r["details"] or "",
             )
             for r in rows
         ]
@@ -360,15 +328,15 @@ class CleaningHistoryManager:
         details: str = "",
         bytes_affected: int | None = None,
     ) -> HistoryEntry:
-        """Inserta transaccionalmente una métrica de recuperación en SQLite (`metricas_recuperacion`)."""
+        """Inserta un nuevo evento en `operations_history` mediante sentencia SQL parametrizada."""
         now = datetime.now()
         actual_bytes = bytes_count if bytes_count is not None else (bytes_affected or 0)
         label = ACTION_LABELS.get(action_type, action_type)
 
         with self._get_connection() as conn:
-            row = conn.execute("SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM metricas_recuperacion").fetchone()
+            row = conn.execute("SELECT COALESCE(MAX(rowid), 0) + 1 AS next_id FROM operations_history").fetchone()
             next_id = row["next_id"] if row else 1
-            entry_id = f"hist_{now.strftime('%Y%m%d_%H%M%S')}_{next_id}"
+            entry_id = f"hist_{now.strftime('%Y%m%d_%H%M%S_%f')}_{next_id}"
 
             new_entry = HistoryEntry(
                 entry_id=entry_id,
@@ -383,7 +351,7 @@ class CleaningHistoryManager:
 
             conn.execute(
                 """
-                INSERT INTO metricas_recuperacion
+                INSERT INTO operations_history
                 (entry_id, timestamp, action_type, action_label, target_dir, files_count, bytes_count, details)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
@@ -402,42 +370,31 @@ class CleaningHistoryManager:
 
         return new_entry
 
-    def get_summary(self, limit_entries: int = 500) -> HistorySummary:
+    def get_summary(self) -> HistorySummary:
         """
-        Calcula mediante agregación SQL en SQLite (sin cargar millones de registros en RAM):
-        - `QUARANTINE`, `HARDLINK`, `TRASH` y `PERMANENT` suman al espacio recuperado.
-        - `RESTORE` descuenta los archivos/bytes devueltos a su ubicación original.
-        - `PURGE` y `PERMANENT` suman al volumen destruido/purgado definitivamente.
+        Optimización Crítica: Delega el cálculo de métricas al motor SQL (SUM, COUNT)
+        sobre `operations_history` sin iterar objetos en memoria Python.
         """
         with self._get_connection() as conn:
             agg = conn.execute(
                 """
-                SELECT
-                    COALESCE(SUM(CASE WHEN action_type IN ('QUARANTINE', 'HARDLINK', 'TRASH', 'PERMANENT', 'PURGE') THEN 1 ELSE 0 END), 0) AS total_ops,
-                    COALESCE(SUM(CASE
-                        WHEN action_type IN ('QUARANTINE', 'HARDLINK', 'TRASH', 'PERMANENT') THEN files_count
-                        WHEN action_type = 'RESTORE' THEN -files_count
-                        ELSE 0
-                    END), 0) AS net_files,
-                    COALESCE(SUM(CASE
-                        WHEN action_type IN ('QUARANTINE', 'HARDLINK', 'TRASH', 'PERMANENT') THEN bytes_count
-                        WHEN action_type = 'RESTORE' THEN -bytes_count
-                        ELSE 0
-                    END), 0) AS net_bytes,
-                    COALESCE(SUM(CASE
-                        WHEN action_type IN ('PERMANENT', 'PURGE') THEN bytes_count
-                        ELSE 0
-                    END), 0) AS purged_forever_bytes
-                FROM metricas_recuperacion
+                SELECT 
+                    COUNT(*) as total_ops,
+                    COALESCE(SUM(CASE WHEN action_type IN ('QUARANTINE', 'HARDLINK', 'TRASH', 'PERMANENT') THEN files_count ELSE 0 END), 0) -
+                    COALESCE(SUM(CASE WHEN action_type = 'RESTORE' THEN files_count ELSE 0 END), 0) as net_files,
+                    COALESCE(SUM(CASE WHEN action_type IN ('QUARANTINE', 'HARDLINK', 'TRASH', 'PERMANENT') THEN bytes_count ELSE 0 END), 0) - 
+                    COALESCE(SUM(CASE WHEN action_type = 'RESTORE' THEN bytes_count ELSE 0 END), 0) as net_bytes,
+                    COALESCE(SUM(CASE WHEN action_type IN ('PERMANENT', 'PURGE') THEN bytes_count ELSE 0 END), 0) as purged_bytes
+                FROM operations_history;
                 """
             ).fetchone()
 
-        total_ops = max(0, int(agg["total_ops"])) if agg else 0
-        net_files = max(0, int(agg["net_files"])) if agg else 0
-        net_bytes = max(0, int(agg["net_bytes"])) if agg else 0
-        purged_forever_bytes = max(0, int(agg["purged_forever_bytes"])) if agg else 0
+        total_ops = max(0, int(agg["total_ops"] or 0)) if agg else 0
+        net_files = max(0, int(agg["net_files"] or 0)) if agg else 0
+        net_bytes = max(0, int(agg["net_bytes"] or 0)) if agg else 0
+        purged_forever_bytes = max(0, int(agg["purged_bytes"] or 0)) if agg else 0
 
-        entries = self.load_entries(limit=limit_entries)
+        entries = self.load_entries()
 
         return HistorySummary(
             total_operations=total_ops,
@@ -452,13 +409,12 @@ class CleaningHistoryManager:
         )
 
     def clear_history(self) -> None:
-        """Limpia transaccionalmente las tablas de historial en SQLite."""
         with self._get_connection() as conn:
             conn.executescript(
                 """
+                DELETE FROM operations_history;
                 DELETE FROM archivos_evaluados;
                 DELETE FROM sesiones_cuarentena;
-                DELETE FROM metricas_recuperacion;
                 """
             )
             conn.commit()
@@ -470,7 +426,7 @@ class CleaningHistoryManager:
         out = Path(output_path).resolve()
         data = {
             "exported_at": datetime.now().isoformat(),
-            "storage_engine": "SQLite3 (WAL Transactional)",
+            "storage_engine": "SQLite3 (operations_history)",
             "database_path": str(self.db_path),
             "total_operations": summary.total_operations,
             "total_files_cleaned": summary.total_files_cleaned,

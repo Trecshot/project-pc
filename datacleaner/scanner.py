@@ -171,47 +171,52 @@ def scan_directory_for_duplicates(
             continue
 
     # Filtrar solo aquellos archivos cuyo st_size colisiona con al menos otro archivo
-    phase1_candidates: list[tuple[int, Path]] = []
+    candidate_files: list[Path] = []
     for f_size, paths in size_map.items():
         if len(paths) > 1:
-            for p in paths:
-                phase1_candidates.append((f_size, p))
+            candidate_files.extend(paths)
 
-    total_phase1 = len(phase1_candidates)
-    summary.size_collision_candidates = total_phase1
-    if total_phase1 == 0:
+    total_candidates = len(candidate_files)
+    summary.size_collision_candidates = total_candidates
+    if total_candidates == 0:
         return {}, summary
 
     safe_workers = get_safe_worker_count(max_workers)
 
     # =========================================================================
-    # FASE 2 (O(k)): Fast Hash Parcial (Primer y Último fragmento de 64 KB)
+    # FASE 2 (O(1) Constante 128 KB): Hash Parcial de Cabecera y Cola (MD5)
     # =========================================================================
     partial_map: dict[tuple[int, str], list[Path]] = {}
 
-    def _run_phase2(item: tuple[int, Path]) -> tuple[int, str | None, Path]:
-        f_size, fp = item
-        p_hash = compute_partial_hash(fp, chunk_size=chunk_size, on_error=log_warning)
-        return f_size, p_hash, fp
+    def _process_candidate(fp: Path) -> tuple[str | None, Path]:
+        # Fase 2: Hash rápido de extremos (primer y último chunk de 64 KB)
+        partial = compute_partial_hash(fp, chunk_size=chunk_size, on_error=log_warning)
+        # El hash completo (Fase 3) se difiere hasta agrupar los parciales
+        return partial, fp
 
     with ThreadPoolExecutor(max_workers=safe_workers) as executor:
-        futures_p2 = {executor.submit(_run_phase2, item): item for item in phase1_candidates}
+        futures_p2 = {executor.submit(_process_candidate, fp): fp for fp in candidate_files}
         p2_done = 0
         for future in as_completed(futures_p2):
             p2_done += 1
             summary.partial_hash_evaluated += 1
-            f_size, p_hash, f_path = future.result()
+            partial, f_path = future.result()
 
             if progress_callback:
                 pct_step = max(1, int(p2_done * 0.4))
-                progress_callback(pct_step, total_phase1, f"[Fase 2 Fast-Hash] {f_path.name}")
+                progress_callback(pct_step, total_candidates, f"[Fase 2 Hash Parcial] {f_path.name}")
 
-            if p_hash is not None:
-                partial_map.setdefault((f_size, p_hash), []).append(f_path)
+            if partial is not None:
+                try:
+                    f_size = f_path.stat(follow_symlinks=False).st_size
+                except OSError:
+                    f_size = 0
+                partial_map.setdefault((f_size, partial), []).append(f_path)
             else:
                 summary.unreadable_files_count += 1
 
-    # Filtrar solo los archivos cuya Fase 2 (Fast Hash de bordes 64 KB) colisionó
+    # Solo si el array resultante del hash parcial contiene más de un elemento (len(paths) > 1),
+    # esos archivos específicos avanzan al segundo ThreadPoolExecutor para el SHA-256 absoluto.
     phase2_survivors: list[Path] = []
     for (_f_size, _p_hash), paths in partial_map.items():
         if len(paths) > 1:
@@ -228,13 +233,13 @@ def scan_directory_for_duplicates(
     # =========================================================================
     hash_map: dict[str, list[Path]] = {}
 
-    def _run_phase3(fp: Path) -> tuple[str | None, Path]:
+    def _process_full_hash(fp: Path) -> tuple[str | None, Path]:
         res_hash = compute_file_hash(fp, chunk_size=chunk_size, on_error=log_warning)
         return res_hash, fp
 
     processed_p3 = 0
     with ThreadPoolExecutor(max_workers=safe_workers) as executor:
-        futures_p3 = {executor.submit(_run_phase3, fp): fp for fp in phase2_survivors}
+        futures_p3 = {executor.submit(_process_full_hash, fp): fp for fp in phase2_survivors}
 
         for future in as_completed(futures_p3):
             processed_p3 += 1

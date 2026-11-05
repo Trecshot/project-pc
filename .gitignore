@@ -34,6 +34,7 @@ _quarantine_*/
 report*.json
 .datacleaner_history.json
 .datacleaner_audit.db*
+.datacleaner.sqlite*
 *.dc_hl_bak
 
 # IDE / Editor
