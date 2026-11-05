@@ -37,6 +37,13 @@ report*.json
 .datacleaner.sqlite*
 *.dc_hl_bak
 
+# Nuitka / PyInstaller Builds
+*.build/
+*.dist/
+*.onefile-build/
+.tcl_bundle/
+nuitka-crash-report.xml
+
 # IDE / Editor
 .vscode/
 .idea/
