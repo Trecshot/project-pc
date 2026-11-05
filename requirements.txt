@@ -3,4 +3,5 @@ pytest>=7.0.0
 sv-ttk>=2.6.0
 send2trash>=1.8.0
 matplotlib>=3.8.0
+nuitka>=2.0.0
 

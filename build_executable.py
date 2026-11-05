@@ -22,6 +22,7 @@ def get_nuitka_command(python_exe: str = sys.executable) -> list[str]:
         "--windows-console-mode=disable",
         "--enable-plugin=tk-inter",
         "--include-data-dir=datacleaner/assets=assets",
+        "--assume-yes-for-downloads",
         "main.py",
     ]
 
