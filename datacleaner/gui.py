@@ -16,6 +16,7 @@ Incluye:
 
 import os
 import sys
+import json
 import subprocess
 import threading
 import ctypes
@@ -43,9 +44,11 @@ from datacleaner.quarantine import (
     purge_all_quarantine_sessions,
     delete_redundant_files,
     execute_deletion_plan,
+    deduplicate_with_hardlinks,
     QuarantineResult,
     RestoreResult,
     DeleteResult,
+    HardlinkResult,
     HAS_SEND2TRASH
 )
 from datacleaner.reporter import (
@@ -860,7 +863,7 @@ class DataCleanerGUI:
             font=("Segoe UI", 9)
         ).pack(side="left")
 
-        # Fila 2 de opciones avanzadas: Modos Directos de Eliminación (Opciones 2 y 3)
+        # Fila 2 de opciones avanzadas: Modos de Acción (Cuarentena, Hardlinks OS, Papelera o Borrado Directo)
         row_opts = ttk.Frame(self.advanced_frame)
         row_opts.pack(fill="x", pady=(10, 0))
 
@@ -870,18 +873,27 @@ class DataCleanerGUI:
             font=("Segoe UI", 9, "bold")
         ).pack(side="left", padx=(0, 10))
 
+        self.hardlink_mode_var = tk.BooleanVar(value=False)
         self.direct_delete_var = tk.BooleanVar(value=False)
         self.use_trash_var = tk.BooleanVar(value=True)
 
+        self.hardlink_check = ttk.Checkbutton(
+            row_opts,
+            text="🔗 Deduplicar con Hardlinks OS (Conserva rutas intactas)",
+            variable=self.hardlink_mode_var,
+            command=self._on_hardlink_toggled
+        )
+        self.hardlink_check.pack(side="left", padx=(0, 14))
+
         self.direct_delete_check = ttk.Checkbutton(
             row_opts,
-            text="Eliminar directamente sin pasar por cuarentena",
+            text="Eliminar directamente sin cuarentena",
             variable=self.direct_delete_var,
-            command=self._on_action_mode_changed
+            command=self._on_direct_delete_toggled
         )
-        self.direct_delete_check.pack(side="left", padx=(0, 16))
+        self.direct_delete_check.pack(side="left", padx=(0, 14))
 
-        trash_label = "Usar Papelera de Reciclaje de Windows (send2trash - Recomendado)" if HAS_SEND2TRASH else "Usar Papelera de Windows"
+        trash_label = "Usar Papelera de Windows (send2trash)" if HAS_SEND2TRASH else "Usar Papelera de Windows"
         self.use_trash_check = ttk.Checkbutton(
             row_opts,
             text=trash_label,
@@ -890,9 +902,22 @@ class DataCleanerGUI:
         )
         self.use_trash_check.pack(side="left")
 
+    def _on_hardlink_toggled(self):
+        if self.hardlink_mode_var.get():
+            self.direct_delete_var.set(False)
+        self._on_action_mode_changed()
+
+    def _on_direct_delete_toggled(self):
+        if self.direct_delete_var.get():
+            self.hardlink_mode_var.set(False)
+        self._on_action_mode_changed()
+
     def _on_action_mode_changed(self):
-        """Actualiza la interfaz según las opciones de cuarentena, papelera o borrado directo."""
-        if not self.direct_delete_var.get():
+        """Actualiza la interfaz según las opciones de cuarentena, hardlinks, papelera o borrado directo."""
+        if self.hardlink_mode_var.get():
+            self.use_trash_check.configure(state="disabled")
+            self.quarantine_btn.configure(text="🔗 Deduplicar con Hardlinks (OS-Level)")
+        elif not self.direct_delete_var.get():
             self.use_trash_check.configure(state="disabled")
             self.quarantine_btn.configure(text="📦 Aislar en Cuarentena")
         else:
@@ -1105,7 +1130,7 @@ class DataCleanerGUI:
         table_container = ttk.Frame(tab_dups)
         table_container.pack(fill="both", expand=True)
 
-        columns = ("group", "action", "size", "hash_short", "path")
+        columns = ("group", "action", "size", "hash_short", "mime_integrity", "path")
         self.tree = ttk.Treeview(
             table_container,
             columns=columns,
@@ -1118,13 +1143,15 @@ class DataCleanerGUI:
         self.tree.heading("action", text="Estado / Acción")
         self.tree.heading("size", text="Tamaño")
         self.tree.heading("hash_short", text="SHA-256")
+        self.tree.heading("mime_integrity", text="Firma Binaria / MIME (Magic)")
         self.tree.heading("path", text="Ruta del Archivo (Doble clic para abrir carpeta)")
 
-        self.tree.column("group", width=70, anchor="center")
-        self.tree.column("action", width=155, anchor="center")
-        self.tree.column("size", width=105, anchor="e")
-        self.tree.column("hash_short", width=110, anchor="center")
-        self.tree.column("path", width=600, anchor="w")
+        self.tree.column("group", width=65, anchor="center")
+        self.tree.column("action", width=150, anchor="center")
+        self.tree.column("size", width=95, anchor="e")
+        self.tree.column("hash_short", width=100, anchor="center")
+        self.tree.column("mime_integrity", width=195, anchor="center")
+        self.tree.column("path", width=480, anchor="w")
 
         scroll_y = ttk.Scrollbar(table_container, orient="vertical", command=self.tree.yview)
         scroll_x = ttk.Scrollbar(table_container, orient="horizontal", command=self.tree.xview)
@@ -1332,6 +1359,7 @@ class DataCleanerGUI:
 
             action_labels = {
                 "QUARANTINE": ("📦 Aislado en Cuarentena", "hist_clean"),
+                "HARDLINK": ("🔗 Deduplicado con Hardlink", "hist_clean"),
                 "TRASH": ("🗑️ Enviado a Papelera", "hist_clean"),
                 "PERMANENT": ("🔥 Eliminación Permanente", "hist_purge"),
                 "PURGE": ("🧹 Cuarentena Purgada", "hist_purge"),
@@ -1419,7 +1447,7 @@ class DataCleanerGUI:
         vals = self._get_selected_row_values()
         if not vals or len(vals) < 5:
             return
-        file_path = Path(vals[4])
+        file_path = Path(vals[-1])
         if not file_path.exists():
             messagebox.showwarning("Archivo no encontrado", f"El archivo ya no se encuentra en:\n{file_path}")
             return
@@ -1435,7 +1463,7 @@ class DataCleanerGUI:
         vals = self._get_selected_row_values()
         if not vals or len(vals) < 5:
             return
-        file_path = Path(vals[4])
+        file_path = Path(vals[-1])
         if file_path.exists() and sys.platform == "win32":
             try:
                 os.startfile(str(file_path))
@@ -1447,8 +1475,8 @@ class DataCleanerGUI:
         if not vals or len(vals) < 5:
             return
         self.root.clipboard_clear()
-        self.root.clipboard_append(str(vals[4]))
-        self.status_label.configure(text=f"📋 Ruta copiada al portapapeles: {vals[4]}")
+        self.root.clipboard_append(str(vals[-1]))
+        self.status_label.configure(text=f"📋 Ruta copiada al portapapeles: {vals[-1]}")
 
     def _copy_selected_hash(self):
         vals = self._get_selected_row_values()
@@ -1469,6 +1497,7 @@ class DataCleanerGUI:
 
         self.tree.tag_configure("keep", background=keep_bg, foreground=keep_fg)
         self.tree.tag_configure("quarantine", background=quar_bg, foreground=quar_fg)
+        self.tree.tag_configure("anomaly", background=purge_bg, foreground=purge_fg)
 
         if hasattr(self, "history_tree"):
             self.history_tree.tag_configure("hist_clean", background=keep_bg, foreground=keep_fg)
@@ -1627,10 +1656,18 @@ class DataCleanerGUI:
         self.cap_files.configure(text=f"Volumen: {format_bytes_with_equivalence(scanned_bytes)}")
 
         self.card_groups.configure(text=f"{meta['duplicate_groups']:,}")
-        self.cap_groups.configure(text="Colisiones exactas SHA-256")
+        p2_discarded = meta.get("partial_hash_discarded", 0)
+        spoofed_cnt = meta.get("spoofed_extensions_count", 0)
+        if p2_discarded > 0:
+            self.cap_groups.configure(text=f"Fast-Hash 64KB descartó {p2_discarded:,} falsos")
+        else:
+            self.cap_groups.configure(text="Pipeline Multi-Stage O(1)→O(k)→O(n)")
 
         self.card_redundant.configure(text=f"{meta['total_redundant_files']:,}")
-        self.cap_redundant.configure(text="Archivos candidatos a limpiar")
+        if spoofed_cnt > 0:
+            self.cap_redundant.configure(text=f"⚠️ {spoofed_cnt} firma(s) binaria(s) anómala(s)")
+        else:
+            self.cap_redundant.configure(text="Firmas binarias Magic verificadas")
 
         self.card_recoverable.configure(text=format_bytes_auto(rec_bytes))
         if rec_bytes > 0:
@@ -1641,22 +1678,68 @@ class DataCleanerGUI:
             self.cap_recoverable.configure(text="Ahorro potencial en disco")
 
         self.all_table_rows.clear()
+        evaluated_db_records: list[dict[str, Any]] = []
+
         for idx, g in enumerate(report["groups"], start=1):
             short_hash = g["hash_sha256"][:8] + "…"
             f_size = g["file_size_formatted"]
+            mime_str = g.get("detected_mime", "application/octet-stream")
+            integ = g.get("integrity_status", "VERIFIED")
+            is_anom = g.get("is_anomaly", False)
+
+            if integ == "THREAT_EXECUTABLE_CAMOUFLAGED":
+                magic_badge = f"⛔ EJECUTABLE CAMUFLADO ({mime_str})"
+            elif is_anom:
+                magic_badge = f"⚠️ EXT. OFUSCADA ({mime_str})"
+            elif integ == "VERIFIED":
+                magic_badge = f"✔ {mime_str}"
+            else:
+                magic_badge = mime_str
 
             self.all_table_rows.append({
-                "values": (f"#{idx}", "✔ CONSERVAR (KEEP)", f_size, short_hash, g["kept_file"]),
-                "tag": "keep",
+                "values": (f"#{idx}", "✔ CONSERVAR (KEEP)", f_size, short_hash, magic_badge, g["kept_file"]),
+                "tag": "anomaly" if is_anom else "keep",
                 "full_hash": g["hash_sha256"]
+            })
+            evaluated_db_records.append({
+                "file_path": g["kept_file"],
+                "file_size": g.get("file_size_bytes", 0),
+                "sha256_hash": g["hash_sha256"],
+                "detected_mime": mime_str,
+                "integrity_status": integ,
+                "action_taken": "KEEP"
             })
 
             for q_file in g["quarantine_files"]:
                 self.all_table_rows.append({
-                    "values": (f"#{idx}", "📦 REDUNDANTE", f_size, short_hash, q_file),
-                    "tag": "quarantine",
+                    "values": (f"#{idx}", "📦 REDUNDANTE", f_size, short_hash, magic_badge, q_file),
+                    "tag": "anomaly" if is_anom else "quarantine",
                     "full_hash": g["hash_sha256"]
                 })
+                evaluated_db_records.append({
+                    "file_path": q_file,
+                    "file_size": g.get("file_size_bytes", 0),
+                    "sha256_hash": g["hash_sha256"],
+                    "detected_mime": mime_str,
+                    "integrity_status": integ,
+                    "action_taken": "QUARANTINE"
+                })
+
+        # Persistir auditoría en SQLite transaccional (tablas sesiones_cuarentena y archivos_evaluados)
+        try:
+            from datetime import datetime
+            scan_session_id = f"scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            self.history_manager.record_audit_session(
+                session_id=scan_session_id,
+                base_dir=meta.get("base_directory", str(self.current_base_dir or "")),
+                keep_rule=meta.get("keep_rule_applied", ""),
+                status="DRY_RUN_COMPLETED",
+                files_count=meta.get("total_redundant_files", 0),
+                bytes_isolated=rec_bytes,
+                evaluated_files=evaluated_db_records
+            )
+        except Exception:
+            pass
 
         self._apply_table_filter()
 
@@ -1664,8 +1747,8 @@ class DataCleanerGUI:
             self.quarantine_btn.configure(state="normal", style="Accent.TButton")
             self._on_action_mode_changed()
             self.status_label.configure(
-                text=f"✅ Simulación completada: {meta['total_redundant_files']} duplicados detectados "
-                     f"({meta['recoverable_formatted']} recuperables)."
+                text=f"✅ Simulación Multi-Stage: {meta['total_redundant_files']} duplicados "
+                     f"({meta['recoverable_formatted']} recuperables) · Fast-Hash filtró {p2_discarded} falsos."
             )
         else:
             self.quarantine_btn.configure(state="disabled", style="TButton")
@@ -1675,8 +1758,14 @@ class DataCleanerGUI:
 
         self.export_btn.configure(state="normal")
         self._log(
-            f"Auditoría finalizada. Grupos: {meta['duplicate_groups']} | "
-            f"Redundantes: {meta['total_redundant_files']} | Recuperable: {meta['recoverable_formatted']}"
+            f"Auditoría Multi-Stage finalizada -> Fase 1 (st_size): {meta.get('size_collision_candidates', 0)} | "
+            f"Fase 2 (Fast-Hash 64KB descartados): {p2_discarded} | "
+            f"Fase 3 (SHA-256 completo): {meta.get('full_hash_evaluated', 0)}"
+        )
+        self._log(
+            f"Resultados -> Grupos: {meta['duplicate_groups']} | "
+            f"Redundantes: {meta['total_redundant_files']} | Recuperable: {meta['recoverable_formatted']} | "
+            f"Anomalías Magic Numbers: {spoofed_cnt}"
         )
 
     def _apply_table_filter(self):
@@ -1691,16 +1780,22 @@ class DataCleanerGUI:
             tag = row["tag"]
             vals = row["values"]
 
-            if mode == "Solo Conservar (KEEP)" and tag != "keep":
+            if mode == "Solo Conservar (KEEP)" and "CONSERVAR" not in str(vals[1]):
                 continue
-            if mode == "Solo Redundantes (QUARANTINE)" and tag != "quarantine":
+            if mode == "Solo Redundantes (QUARANTINE)" and "REDUNDANTE" not in str(vals[1]):
                 continue
 
             if query:
-                path_lower = str(vals[4]).lower()
+                path_lower = str(vals[-1]).lower()
+                mime_lower = str(vals[4]).lower() if len(vals) > 5 else ""
                 hash_lower = str(row.get("full_hash", "")).lower()
                 group_lower = str(vals[0]).lower()
-                if query not in path_lower and query not in hash_lower and query not in group_lower:
+                if (
+                    query not in path_lower
+                    and query not in hash_lower
+                    and query not in group_lower
+                    and query not in mime_lower
+                ):
                     continue
 
             self.tree.insert("", tk.END, values=vals, tags=(tag,))
@@ -1714,6 +1809,50 @@ class DataCleanerGUI:
         rule_key = self.rule_combobox.get()
         keep_rule = RULE_OPTIONS.get(rule_key, KeepRule.DEEPEST_THEN_NEWEST.value)
         plan = build_audit_plan(self.last_duplicates, keep_rule=keep_rule)
+
+        # Opción 3 (Arquitectura Avanzada): Deduplicación Transparente mediante Hardlinks (OS-Level)
+        if getattr(self, "hardlink_mode_var", None) and self.hardlink_mode_var.get():
+            resp = messagebox.askyesno(
+                "Confirmar Deduplicación Transparente con Hardlinks (OS-Level)",
+                f"¿Desea reemplazar {total_redundant} copias redundantes ({rec_str}) por enlaces físicos (Hardlinks) del sistema operativo?\n\n"
+                f"Ventajas de Deduplicación OS-Level (NTFS / ext4 / APFS):\n"
+                f"• Se recupera el 100% del espacio redundante de inmediato.\n"
+                f"• NINGUNA ruta se elimina ni se mueve: los archivos siguen existiendo en todas sus carpetas originales apuntando al mismo clúster físico en disco.\n"
+                f"• Ideal para proyectos de software, dependencias y recursos estáticos.",
+                icon="question"
+            )
+            if not resp:
+                return
+
+            try:
+                res_hl: HardlinkResult = deduplicate_with_hardlinks(plan)
+                self.history_manager.record_event(
+                    action_type="HARDLINK",
+                    target_dir=str(self.current_base_dir),
+                    files_count=res_hl.total_linked,
+                    bytes_affected=res_hl.total_bytes_saved,
+                    details="Enlaces físicos OS-Level (os.link)"
+                )
+                self._refresh_history_view()
+                self._log(
+                    f"\n✔ Deduplicación Hardlink OS-Level: {res_hl.total_linked} archivos enlazados "
+                    f"({format_bytes_with_equivalence(res_hl.total_bytes_saved)} liberados sin alterar rutas)."
+                )
+                if res_hl.errors:
+                    for err in res_hl.errors:
+                        self._log(f"  ⚠ {err}")
+
+                messagebox.showinfo(
+                    "Deduplicación por Hardlinks Completada",
+                    f"Se enlazaron físicamente {res_hl.total_linked} archivos liberando "
+                    f"{format_bytes_with_equivalence(res_hl.total_bytes_saved)}.\n\n"
+                    f"Todas las rutas originales permanecen intactas en su árbol de directorios."
+                )
+                self.quarantine_btn.configure(state="disabled", style="TButton")
+                self._start_scan_thread()
+            except Exception as e:
+                messagebox.showerror("Error en Hardlinks", f"Ocurrió un error al crear enlaces físicos: {e}")
+            return
 
         # Opción 2 y 3: Eliminación directa (Papelera de Windows o Destrucción Permanente)
         if self.direct_delete_var.get():

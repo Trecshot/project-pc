@@ -1,11 +1,11 @@
 """
-Motor de Escaneo y Detección de Duplicados (Hardened Core Engine)
+Motor de Escaneo y Detección de Duplicados con Dispersión Escalonada (Multi-Stage Hashing)
 DataCleaner CLI/GUI
 
-Escaneo concurrente de directorios mediante ThreadPoolExecutor.
-Protección estricta contra bucles infinitos por enlaces simbólicos (symlinks) y uniones (junctions en Windows).
-Manejo no destructivo de archivos bloqueados por el sistema operativo mediante registro de advertencias.
-Cumple con RF-03, RF-04, RNF-01, RNF-02 y las directrices de hardening.
+Pipeline de evaluación en tres fases (O(1) -> O(k) -> O(n)):
+- Fase 1 (O(1)): Agrupación por tamaño exacto (st_size) y detección de inodos compartidos (Hardlinks).
+- Fase 2 (O(k)): Fast Hash parcial sobre el primer y último bloque de 64 KB para descartar falsos positivos de tamaño.
+- Fase 3 (O(n)): SHA-256 criptográfico completo únicamente sobre colisiones de Fase 2 + Auditoría de Firmas Binarias (Magic Numbers).
 """
 
 from pathlib import Path
@@ -14,11 +14,18 @@ from dataclasses import dataclass, field
 from typing import Callable, Generator
 import os
 
-from datacleaner.hasher import compute_file_hash, get_safe_worker_count, DEFAULT_CHUNK_SIZE
+from datacleaner.hasher import (
+    compute_file_hash,
+    compute_partial_hash,
+    get_safe_worker_count,
+    DEFAULT_CHUNK_SIZE,
+)
+from datacleaner.magic import analyze_file_signature, FileSignatureReport
+
 
 @dataclass
 class ScanSummary:
-    """Metadatos globales del proceso de auditoría."""
+    """Metadatos globales del proceso de auditoría y telemetría Multi-Stage."""
     base_dir: Path
     total_files_scanned: int = 0
     total_bytes_scanned: int = 0
@@ -26,7 +33,18 @@ class ScanSummary:
     total_duplicate_files: int = 0
     recoverable_bytes: int = 0
     unreadable_files_count: int = 0
+    # Telemetría del Pipeline Multi-Stage (O(1) -> O(k) -> O(n))
+    size_collision_candidates: int = 0
+    partial_hash_evaluated: int = 0
+    partial_hash_discarded: int = 0
+    full_hash_evaluated: int = 0
+    already_hardlinked_skipped: int = 0
+    # Telemetría de Integridad por Firmas Binarias (Magic Numbers)
+    spoofed_extensions_count: int = 0
+    signature_anomalies: list[dict] = field(default_factory=list)
+    file_signatures: dict[str, FileSignatureReport] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
+
 
 def is_symlink_or_junction(path: Path) -> bool:
     """
@@ -34,15 +52,12 @@ def is_symlink_or_junction(path: Path) -> bool:
     Previene recursión infinita y conteos duplicados.
     """
     try:
-        # 1. Comprobación de enlace simbólico estándar
         if path.is_symlink() or os.path.islink(path):
             return True
 
-        # 2. Comprobación de junction en Windows (Python 3.12+)
         if hasattr(path, "is_junction") and path.is_junction():
             return True
 
-        # 3. Verificación de atributos reparse point en Windows
         stat_result = path.stat(follow_symlinks=False)
         if hasattr(stat_result, "st_file_attributes"):
             FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
@@ -51,8 +66,8 @@ def is_symlink_or_junction(path: Path) -> bool:
 
         return False
     except (PermissionError, OSError):
-        # En caso de error de acceso en el enlace, tratarlo como protegido/enlace para omitirlo
         return True
+
 
 def iter_directory_files(base_dir: Path, on_warning: Callable[[str], None] | None = None) -> Generator[Path, None, None]:
     """
@@ -63,15 +78,12 @@ def iter_directory_files(base_dir: Path, on_warning: Callable[[str], None] | Non
         for root, dirs, files in os.walk(base_dir, followlinks=False):
             root_path = Path(root)
 
-            # Modificar 'dirs' in-place para podar carpetas que no deben explorarse recursivamente
             safe_dirs = []
             for d in dirs:
-                # Omitir subdirectorios de cuarentena previas
                 if d.startswith("_quarantine_"):
                     continue
 
                 d_path = root_path / d
-                # Filtrar enlaces simbólicos y junctions en Windows
                 if is_symlink_or_junction(d_path):
                     if on_warning:
                         on_warning(f"Omitiendo enlace simbólico/junction de directorio: '{d_path}'")
@@ -81,11 +93,9 @@ def iter_directory_files(base_dir: Path, on_warning: Callable[[str], None] | Non
 
             dirs[:] = safe_dirs
 
-            # Procesar archivos regulares del directorio actual
             for f in files:
                 file_path = root_path / f
 
-                # Ignorar enlaces simbólicos a archivos
                 if is_symlink_or_junction(file_path):
                     continue
 
@@ -102,6 +112,7 @@ def iter_directory_files(base_dir: Path, on_warning: Callable[[str], None] | Non
             on_warning(f"Error accediendo al árbol de directorios en '{base_dir}': {e}")
         return
 
+
 def scan_directory_for_duplicates(
     base_dir: Path,
     max_workers: int | None = None,
@@ -110,25 +121,10 @@ def scan_directory_for_duplicates(
     warning_callback: Callable[[str], None] | None = None
 ) -> tuple[dict[str, list[Path]], ScanSummary]:
     """
-    Escanea recursivamente un directorio seguro y agrupa archivos por su hash SHA-256.
-
-    Estrategia de rendimiento y hardening:
-    1. Agrupación preliminar por tamaño de archivo (st_size) en O(1) de metadatos.
-    2. Filtrado explícito de enlaces simbólicos y junctions de Windows (previene bucles infinitos).
-    3. Hashing SHA-256 concurrente con número regulado de hilos para evitar saturación de descriptores (Too many open files).
-    4. Manejo silencioso y robusto de PermissionError/OSError registrando advertencias.
-
-    Args:
-        base_dir: Directorio validado a auditar.
-        max_workers: Número de hilos solicitados (regulado automáticamente a un rango seguro).
-        chunk_size: Tamaño de bloque de lectura binaria (bytes).
-        progress_callback: Callback opcional(procesados, total, archivo_actual).
-        warning_callback: Callback opcional(mensaje_advertencia).
-
-    Returns:
-        Tupla con:
-        - Diccionario de hashes duplicados: {sha256: [ruta1, ruta2, ...]} (len(paths) > 1)
-        - Resumen estadístico ScanSummary
+    Escanea recursivamente un directorio seguro aplicando el Algoritmo de Dispersión Escalonada:
+    - Fase 1 (O(1)): Agrupación por tamaño exacto en bytes (st_size) + filtro de inodos (Hardlinks).
+    - Fase 2 (O(k)): Fast Hash parcial (primer y último chunk de 64 KB) para descartar falsas colisiones.
+    - Fase 3 (O(n)): SHA-256 criptográfico completo solo cuando la Fase 2 colisiona + Magic Numbers.
     """
     summary = ScanSummary(base_dir=base_dir)
 
@@ -137,8 +133,12 @@ def scan_directory_for_duplicates(
         if warning_callback:
             warning_callback(msg)
 
-    # Paso 1: Mapeo preliminar por tamaño de archivo usando generador seguro
+    # =========================================================================
+    # FASE 1 (O(1)): Agrupación por st_size y detección de Hardlinks existentes
+    # =========================================================================
     size_map: dict[int, list[Path]] = {}
+    seen_inodes_per_size: dict[int, set[tuple[int, int]]] = {}
+
     for file_path in iter_directory_files(base_dir, on_warning=log_warning):
         summary.total_files_scanned += 1
         try:
@@ -146,51 +146,110 @@ def scan_directory_for_duplicates(
             file_size = stat.st_size
             summary.total_bytes_scanned += file_size
 
-            if file_size not in size_map:
-                size_map[file_size] = []
-            size_map[file_size].append(file_path)
+            # Auditoría forense de firma binaria (Magic Numbers) en archivos escaneados
+            sig_report = analyze_file_signature(file_path)
+            summary.file_signatures[str(file_path.resolve())] = sig_report
+            if sig_report.is_anomaly:
+                summary.spoofed_extensions_count += 1
+                summary.signature_anomalies.append(sig_report.to_dict())
+                log_warning(sig_report.forensic_note)
+
+            # Si el archivo ya es un Hardlink apuntando a un inodo físico ya registrado,
+            # no ocupa espacio físico adicional en disco: se contabiliza y omite de duplicados.
+            inode_key = ( getattr(stat, "st_dev", 0), getattr(stat, "st_ino", 0) )
+            if inode_key[1] != 0:
+                inodes_set = seen_inodes_per_size.setdefault(file_size, set())
+                if inode_key in inodes_set:
+                    summary.already_hardlinked_skipped += 1
+                    continue
+                inodes_set.add(inode_key)
+
+            size_map.setdefault(file_size, []).append(file_path)
         except (PermissionError, OSError) as e:
             summary.unreadable_files_count += 1
             log_warning(f"No se pudieron leer metadatos de '{file_path}': {e}")
             continue
 
-    # Filtrar solo aquellos archivos cuyos tamaños colisionan con al menos otro archivo
-    candidate_files: list[Path] = []
+    # Filtrar solo aquellos archivos cuyo st_size colisiona con al menos otro archivo
+    phase1_candidates: list[tuple[int, Path]] = []
     for f_size, paths in size_map.items():
         if len(paths) > 1:
-            candidate_files.extend(paths)
+            for p in paths:
+                phase1_candidates.append((f_size, p))
 
-    total_candidates = len(candidate_files)
-    if total_candidates == 0:
+    total_phase1 = len(phase1_candidates)
+    summary.size_collision_candidates = total_phase1
+    if total_phase1 == 0:
         return {}, summary
 
-    # Paso 2: Cálculo concurrente de SHA-256 con regulación estricta de trabajadores
     safe_workers = get_safe_worker_count(max_workers)
-    hash_map: dict[str, list[Path]] = {}
 
-    def _process_candidate(fp: Path) -> tuple[str | None, Path]:
-        res_hash = compute_file_hash(fp, chunk_size=chunk_size, on_error=log_warning)
-        return res_hash, fp
+    # =========================================================================
+    # FASE 2 (O(k)): Fast Hash Parcial (Primer y Último fragmento de 64 KB)
+    # =========================================================================
+    partial_map: dict[tuple[int, str], list[Path]] = {}
 
-    processed_count = 0
+    def _run_phase2(item: tuple[int, Path]) -> tuple[int, str | None, Path]:
+        f_size, fp = item
+        p_hash = compute_partial_hash(fp, chunk_size=chunk_size, on_error=log_warning)
+        return f_size, p_hash, fp
+
     with ThreadPoolExecutor(max_workers=safe_workers) as executor:
-        futures = {executor.submit(_process_candidate, fp): fp for fp in candidate_files}
-
-        for future in as_completed(futures):
-            processed_count += 1
-            res_hash, f_path = future.result()
+        futures_p2 = {executor.submit(_run_phase2, item): item for item in phase1_candidates}
+        p2_done = 0
+        for future in as_completed(futures_p2):
+            p2_done += 1
+            summary.partial_hash_evaluated += 1
+            f_size, p_hash, f_path = future.result()
 
             if progress_callback:
-                progress_callback(processed_count, total_candidates, str(f_path.name))
+                pct_step = max(1, int(p2_done * 0.4))
+                progress_callback(pct_step, total_phase1, f"[Fase 2 Fast-Hash] {f_path.name}")
 
-            if res_hash:
-                if res_hash not in hash_map:
-                    hash_map[res_hash] = []
-                hash_map[res_hash].append(f_path)
+            if p_hash is not None:
+                partial_map.setdefault((f_size, p_hash), []).append(f_path)
             else:
                 summary.unreadable_files_count += 1
 
-    # Paso 3: Filtrar para conservar únicamente hashes con más de 1 archivo (duplicados reales)
+    # Filtrar solo los archivos cuya Fase 2 (Fast Hash de bordes 64 KB) colisionó
+    phase2_survivors: list[Path] = []
+    for (_f_size, _p_hash), paths in partial_map.items():
+        if len(paths) > 1:
+            phase2_survivors.extend(paths)
+        else:
+            summary.partial_hash_discarded += len(paths)
+
+    total_phase3 = len(phase2_survivors)
+    if total_phase3 == 0:
+        return {}, summary
+
+    # =========================================================================
+    # FASE 3 (O(n)): SHA-256 Criptográfico Completo (solo sobrevivientes Fase 2)
+    # =========================================================================
+    hash_map: dict[str, list[Path]] = {}
+
+    def _run_phase3(fp: Path) -> tuple[str | None, Path]:
+        res_hash = compute_file_hash(fp, chunk_size=chunk_size, on_error=log_warning)
+        return res_hash, fp
+
+    processed_p3 = 0
+    with ThreadPoolExecutor(max_workers=safe_workers) as executor:
+        futures_p3 = {executor.submit(_run_phase3, fp): fp for fp in phase2_survivors}
+
+        for future in as_completed(futures_p3):
+            processed_p3 += 1
+            summary.full_hash_evaluated += 1
+            res_hash, f_path = future.result()
+
+            if progress_callback:
+                progress_callback(processed_p3, total_phase3, f_path.name)
+
+            if res_hash:
+                hash_map.setdefault(res_hash, []).append(f_path)
+            else:
+                summary.unreadable_files_count += 1
+
+    # Filtrar para conservar únicamente hashes SHA-256 con más de 1 archivo (duplicados reales)
     duplicates: dict[str, list[Path]] = {}
     recoverable_bytes = 0
     total_dup_files = 0
@@ -202,7 +261,7 @@ def scan_directory_for_duplicates(
                 single_file_size = paths[0].stat().st_size
             except (OSError, IndexError):
                 single_file_size = 0
-            
+
             redundant_count = len(paths) - 1
             recoverable_bytes += (single_file_size * redundant_count)
             total_dup_files += len(paths)

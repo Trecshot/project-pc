@@ -10,6 +10,8 @@ from pathlib import Path
 
 from datacleaner.scanner import scan_directory_for_duplicates
 from datacleaner.reporter import build_audit_plan
+from datacleaner.hasher import compute_partial_hash
+from datacleaner.magic import analyze_file_signature
 from datacleaner.quarantine import (
     quarantine_redundant_files,
     restore_from_quarantine,
@@ -18,9 +20,11 @@ from datacleaner.quarantine import (
     purge_all_quarantine_sessions,
     delete_redundant_files,
     execute_deletion_plan,
+    deduplicate_with_hardlinks,
     QuarantineResult,
     RestoreResult,
-    DeleteResult
+    DeleteResult,
+    HardlinkResult,
 )
 from datacleaner.history import (
     CleaningHistoryManager,
@@ -249,6 +253,141 @@ class TestQuarantineAndRestore(unittest.TestCase):
         summary_after_purge = mgr.get_summary()
         self.assertEqual(summary_after_purge.total_bytes_recovered, b_600mb + b_650mb)
         self.assertEqual(summary_after_purge.total_bytes_purged, b_600mb)
+
+    def test_multi_stage_hashing_pipeline_o1_ok_on(self):
+        """
+        Instrucción 1: Verifica el Algoritmo de Dispersión Escalonada (O(1) -> O(k) -> O(n)).
+        Dos archivos grandes (> 256 KB) con igual st_size pero distinto primer/último chunk de 64 KB
+        deben ser descartados en la Fase 2 (Fast-Hash) sin ejecutar SHA-256 completo (Fase 3).
+        """
+        stage_dir = self.base_path / "MultiStage"
+        stage_dir.mkdir(parents=True)
+
+        f1 = stage_dir / "iso_a.bin"
+        f2 = stage_dir / "iso_b.bin"
+        # Crear 300 KB con igual centro pero diferente primer/último bloque de 64 KB
+        middle = b"M" * (172 * 1024)
+        f1.write_bytes(b"A" * 65536 + middle + b"X" * 65536)
+        f2.write_bytes(b"B" * 65536 + middle + b"Y" * 65536)
+
+        self.assertNotEqual(compute_partial_hash(f1), compute_partial_hash(f2))
+
+        duplicates, summary = scan_directory_for_duplicates(stage_dir)
+        self.assertEqual(len(duplicates), 0)
+        self.assertEqual(summary.size_collision_candidates, 2)
+        self.assertEqual(summary.partial_hash_evaluated, 2)
+        self.assertEqual(summary.partial_hash_discarded, 2)
+        self.assertEqual(summary.full_hash_evaluated, 0, "Fase 3 no debe ejecutarse si Fase 2 descarta la colisión")
+
+    def test_magic_numbers_binary_signature_integrity(self):
+        """
+        Instrucción 2: Verifica Análisis de Integridad por Firmas Binarias (Magic Numbers).
+        Detecta documentos PDF genuinos, extensiones manipuladas y ejecutables MZ camuflados.
+        """
+        magic_dir = self.base_path / "ForensicMagic"
+        magic_dir.mkdir(parents=True)
+
+        # 1. PDF genuino (%PDF = 25 50 44 46)
+        valid_pdf = magic_dir / "contrato.pdf"
+        valid_pdf.write_bytes(b"%PDF-1.7\nContenido PDF genuino")
+        rep_pdf = analyze_file_signature(valid_pdf)
+        self.assertEqual(rep_pdf.integrity_status, "VERIFIED")
+        self.assertEqual(rep_pdf.detected_mime, "application/pdf")
+        self.assertTrue(rep_pdf.header_hex.startswith("25 50 44 46"))
+        self.assertFalse(rep_pdf.is_anomaly)
+
+        # 2. Extensión ofuscada (.jpg que en realidad contiene %PDF)
+        spoofed_jpg = magic_dir / "foto_falsa.jpg"
+        spoofed_jpg.write_bytes(b"%PDF-1.7\nContenido PDF con extension JPG")
+        rep_spoof = analyze_file_signature(spoofed_jpg)
+        self.assertEqual(rep_spoof.integrity_status, "EXTENSION_MISMATCH")
+        self.assertTrue(rep_spoof.is_anomaly)
+
+        # 3. Ejecutable PE (MZ = 4D 5A) camuflado como documento .pdf
+        camouflaged_exe = magic_dir / "factura_urgente.pdf"
+        camouflaged_exe.write_bytes(b"MZ\x90\x00\x03\x00\x00\x00Payload ejecutable")
+        rep_threat = analyze_file_signature(camouflaged_exe)
+        self.assertEqual(rep_threat.integrity_status, "THREAT_EXECUTABLE_CAMOUFLAGED")
+        self.assertTrue(rep_threat.is_anomaly)
+
+    def test_os_level_hardlinks_deduplication(self):
+        """
+        Instrucción 3: Verifica Deduplicación Transparente mediante Hardlinks (os.link).
+        Reemplaza copias redundantes por enlaces físicos al mismo clúster sin romper rutas.
+        """
+        hl_dir = self.base_path / "HardlinkProject"
+        hl_dir.mkdir(parents=True)
+        sub_a = hl_dir / "module_a"
+        sub_b = hl_dir / "module_b"
+        sub_a.mkdir()
+        sub_b.mkdir()
+
+        f1 = sub_a / "static_asset.bin"
+        f2 = sub_b / "static_asset_copy.bin"
+        payload = b"Recurso estatico compartido de 1024 bytes " * 64
+        f1.write_bytes(payload)
+        f2.write_bytes(payload)
+
+        duplicates, _ = scan_directory_for_duplicates(hl_dir)
+        plan = build_audit_plan(duplicates)
+        hl_res = deduplicate_with_hardlinks(plan)
+
+        self.assertEqual(hl_res.total_linked, 1)
+        self.assertEqual(hl_res.total_bytes_saved, len(payload))
+        # Ambos archivos siguen existiendo en sus rutas originales
+        self.assertTrue(f1.exists())
+        self.assertTrue(f2.exists())
+        # Y apuntan exactamente al mismo inodo físico en NTFS/ext4/APFS
+        self.assertEqual(f1.stat().st_ino, f2.stat().st_ino)
+
+        # Un segundo escaneo debe reconocer que ya están deduplicados por hardlink
+        dups_after, summary_after = scan_directory_for_duplicates(hl_dir)
+        self.assertEqual(len(dups_after), 0)
+        self.assertEqual(summary_after.already_hardlinked_skipped, 1)
+
+    def test_sqlite_transactional_schema_tables(self):
+        """
+        Instrucción 4: Verifica que las 3 tablas relacionales SQLite normalizadas
+        (sesiones_cuarentena, archivos_evaluados, metricas_recuperacion) operen transaccionalmente.
+        """
+        db_file = self.base_path / "audit_test.db"
+        mgr = CleaningHistoryManager(storage_path=db_file)
+
+        mgr.record_audit_session(
+            session_id="sess_20261105_01",
+            base_dir=self.base_path,
+            keep_rule="deepest_then_newest",
+            status="ACTIVE",
+            files_count=2,
+            bytes_isolated=4096,
+            evaluated_files=[
+                {
+                    "file_path": str(self.base_path / "doc.pdf"),
+                    "file_size": 2048,
+                    "fast_hash": "abcd1234",
+                    "sha256_hash": "ef0123456789",
+                    "detected_mime": "application/pdf",
+                    "integrity_status": "VERIFIED",
+                    "action_taken": "KEEP",
+                }
+            ]
+        )
+        mgr.update_quarantine_session_status("sess_20261105_01", "PURGED")
+
+        with mgr._get_connection() as conn:
+            sess_row = conn.execute(
+                "SELECT status, bytes_isolated FROM sesiones_cuarentena WHERE session_id = ?",
+                ("sess_20261105_01",)
+            ).fetchone()
+            self.assertEqual(sess_row["status"], "PURGED")
+            self.assertEqual(sess_row["bytes_isolated"], 4096)
+
+            eval_row = conn.execute(
+                "SELECT detected_mime, integrity_status FROM archivos_evaluados WHERE session_id = ?",
+                ("sess_20261105_01",)
+            ).fetchone()
+            self.assertEqual(eval_row["detected_mime"], "application/pdf")
+            self.assertEqual(eval_row["integrity_status"], "VERIFIED")
 
 
 if __name__ == "__main__":

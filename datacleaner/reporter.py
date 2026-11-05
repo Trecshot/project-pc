@@ -14,6 +14,7 @@ import math
 
 from datacleaner.rules import select_file_to_keep, KeepRule
 from datacleaner.scanner import ScanSummary
+from datacleaner.magic import analyze_file_signature
 
 def format_bytes(bytes_count: int) -> str:
     """Convierte bytes a formato legible (B, KB, MB, GB, TB) escalando automáticamente."""
@@ -45,6 +46,8 @@ def build_audit_plan(
         except (OSError, IndexError):
             size = 0
 
+        sig = analyze_file_signature(kept_file)
+
         plan.append({
             "hash": sha,
             "size_per_file": size,
@@ -53,7 +56,13 @@ def build_audit_plan(
             "quarantine": quarantine_files,
             "recoverable_bytes": size * len(quarantine_files),
             "recoverable_formatted": format_bytes(size * len(quarantine_files)),
-            "total_group_files": len(paths)
+            "total_group_files": len(paths),
+            "detected_mime": sig.detected_mime,
+            "detected_format": sig.detected_format,
+            "header_hex": sig.header_hex,
+            "integrity_status": sig.integrity_status,
+            "is_anomaly": sig.is_anomaly,
+            "forensic_note": sig.forensic_note,
         })
     return plan
 
@@ -81,6 +90,13 @@ def generate_report_dict(
             "recoverable_bytes": total_recoverable_bytes,
             "recoverable_formatted": format_bytes(total_recoverable_bytes),
             "unreadable_files": summary.unreadable_files_count,
+            "size_collision_candidates": getattr(summary, "size_collision_candidates", 0),
+            "partial_hash_evaluated": getattr(summary, "partial_hash_evaluated", 0),
+            "partial_hash_discarded": getattr(summary, "partial_hash_discarded", 0),
+            "full_hash_evaluated": getattr(summary, "full_hash_evaluated", 0),
+            "already_hardlinked_skipped": getattr(summary, "already_hardlinked_skipped", 0),
+            "spoofed_extensions_count": getattr(summary, "spoofed_extensions_count", 0),
+            "signature_anomalies": getattr(summary, "signature_anomalies", []),
             "warnings_count": len(summary.warnings),
             "warnings": summary.warnings
         },
@@ -92,7 +108,13 @@ def generate_report_dict(
                 "kept_file": str(g["keep"].resolve()),
                 "quarantine_files": [str(p.resolve()) for p in g["quarantine"]],
                 "group_recoverable_bytes": g["recoverable_bytes"],
-                "group_recoverable_formatted": g["recoverable_formatted"]
+                "group_recoverable_formatted": g["recoverable_formatted"],
+                "detected_mime": g["detected_mime"],
+                "detected_format": g["detected_format"],
+                "header_hex": g["header_hex"],
+                "integrity_status": g["integrity_status"],
+                "is_anomaly": g["is_anomaly"],
+                "forensic_note": g["forensic_note"],
             }
             for g in plan
         ]

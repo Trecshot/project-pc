@@ -3,7 +3,8 @@ DataCleaner - Gestor Local de Organización y Auditoría de Archivos por Hash
 """
 
 from datacleaner.security import validate_target_path, SYSTEM_BLACKLIST
-from datacleaner.hasher import compute_file_hash
+from datacleaner.hasher import compute_file_hash, compute_partial_hash
+from datacleaner.magic import analyze_file_signature, FileSignatureReport
 from datacleaner.scanner import scan_directory_for_duplicates, ScanSummary
 from datacleaner.rules import select_file_to_keep, KeepRule
 from datacleaner.quarantine import (
@@ -14,9 +15,11 @@ from datacleaner.quarantine import (
     purge_all_quarantine_sessions,
     delete_redundant_files,
     execute_deletion_plan,
+    deduplicate_with_hardlinks,
     QuarantineResult,
     RestoreResult,
-    DeleteResult
+    DeleteResult,
+    HardlinkResult
 )
 from datacleaner.reporter import (
     build_audit_plan,
@@ -38,6 +41,9 @@ __all__ = [
     "validate_target_path",
     "SYSTEM_BLACKLIST",
     "compute_file_hash",
+    "compute_partial_hash",
+    "analyze_file_signature",
+    "FileSignatureReport",
     "scan_directory_for_duplicates",
     "ScanSummary",
     "select_file_to_keep",
@@ -49,9 +55,11 @@ __all__ = [
     "purge_all_quarantine_sessions",
     "delete_redundant_files",
     "execute_deletion_plan",
+    "deduplicate_with_hardlinks",
     "QuarantineResult",
     "RestoreResult",
     "DeleteResult",
+    "HardlinkResult",
     "build_audit_plan",
     "generate_report_dict",
     "print_rich_report",

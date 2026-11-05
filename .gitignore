@@ -33,6 +33,8 @@ htmlcov/
 _quarantine_*/
 report*.json
 .datacleaner_history.json
+.datacleaner_audit.db*
+*.dc_hl_bak
 
 # IDE / Editor
 .vscode/

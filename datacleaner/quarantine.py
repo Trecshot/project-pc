@@ -61,6 +61,15 @@ class DeleteResult:
     deleted_paths: list[str]
     errors: list[str]
 
+
+@dataclass
+class HardlinkResult:
+    """Resultado de la deduplicación transparente a nivel de sistema operativo mediante Hardlinks."""
+    total_linked: int
+    total_bytes_saved: int
+    linked_paths: list[str]
+    errors: list[str]
+
 def _format_bytes(bytes_count: int) -> str:
     """Convierte bytes a formato legible (B, KB, MB, GB, TB) escalando automáticamente."""
     if bytes_count <= 0:
@@ -440,4 +449,90 @@ def execute_deletion_plan(
         all_redundant.extend(group.get("quarantine", []))
 
     return delete_redundant_files(all_redundant, use_trash=use_trash)
+
+
+def deduplicate_with_hardlinks(quarantine_plan: list[dict]) -> HardlinkResult:
+    """
+    Deduplicación Transparente mediante Hardlinks (OS-Level: NTFS, ext4, APFS):
+    En lugar de mover el archivo a cuarentena o eliminar su ruta en el árbol del usuario,
+    reemplaza de forma atómica cada copia redundante por un enlace físico (`os.link(keep_file, redundant_file)`)
+    que apunta al mismo clúster de datos físicos en disco que el archivo maestro (`keep`).
+
+    Garantía Transaccional (Zero Data Loss):
+    1. Renombra temporalmente la copia redundante a un archivo `.dc_hl_bak` en su misma carpeta.
+    2. Crea el enlace físico `os.link(keep_path, redundant_path)`.
+    3. Si tiene éxito, elimina el respaldo temporal `.dc_hl_bak`.
+    4. Si falla (ej. volumen distinto o sistema de archivos sin soporte de hardlinks),
+       restaura de inmediato el respaldo temporal a su nombre original.
+    """
+    linked_paths: list[str] = []
+    errors: list[str] = []
+    total_linked = 0
+    total_bytes_saved = 0
+
+    for group in quarantine_plan:
+        keep_raw = group.get("keep")
+        if not keep_raw:
+            continue
+        keep_path = Path(keep_raw).resolve().absolute()
+        if not keep_path.exists():
+            errors.append(f"Archivo maestro KEEP no existe: {keep_path}")
+            continue
+
+        try:
+            keep_stat = keep_path.stat()
+        except OSError as e:
+            errors.append(f"No se pudo inspeccionar archivo maestro '{keep_path}': {e}")
+            continue
+
+        redundant_list: list[Path] = group.get("quarantine", [])
+        for red_raw in redundant_list:
+            red_path = Path(red_raw).resolve().absolute()
+            if not red_path.exists() or red_path == keep_path:
+                continue
+
+            try:
+                red_stat = red_path.stat()
+                # Si ya apuntan al mismo inodo físico en el mismo volumen, omitir
+                if (
+                    getattr(keep_stat, "st_ino", 0) != 0
+                    and keep_stat.st_dev == red_stat.st_dev
+                    and keep_stat.st_ino == red_stat.st_ino
+                ):
+                    continue
+
+                file_size = red_stat.st_size
+                backup_path = red_path.with_name(f".{red_path.name}.dc_hl_bak")
+                counter = 1
+                while backup_path.exists():
+                    backup_path = red_path.with_name(f".{red_path.name}.{counter}.dc_hl_bak")
+                    counter += 1
+
+                # Paso 1: Renombrado atómico a respaldo temporal
+                red_path.replace(backup_path)
+                try:
+                    # Paso 2: Crear Hardlink físico en la ruta original apuntando al inodo de keep_path
+                    os.link(str(keep_path), str(red_path))
+                except Exception as link_err:
+                    # Rollback atómico inmediato si os.link falla
+                    if backup_path.exists() and not red_path.exists():
+                        backup_path.replace(red_path)
+                    errors.append(f"No se pudo crear hardlink para '{red_path}': {link_err}")
+                    continue
+
+                # Paso 3: Eliminar el respaldo temporal una vez confirmado el hardlink
+                backup_path.unlink(missing_ok=True)
+                total_linked += 1
+                total_bytes_saved += file_size
+                linked_paths.append(str(red_path))
+            except Exception as e:
+                errors.append(f"Error procesando hardlink en '{red_path}': {e}")
+
+    return HardlinkResult(
+        total_linked=total_linked,
+        total_bytes_saved=total_bytes_saved,
+        linked_paths=linked_paths,
+        errors=errors
+    )
+
 
