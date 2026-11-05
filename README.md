@@ -187,4 +187,24 @@ Cobertura de pruebas:
 - `test_hasher.py`: Exactitud de SHA-256, lectura por bloques de 64 KB y tolerancia a fallos.
 - `test_rules.py`: Evaluación de profundidad, penalización de carpetas de descargas/temporales y fechas de modificación.
 - `test_scanner.py`: Escaneo concurrente, discriminación de falsos positivos (mismo tamaño pero diferente contenido) e ignorado de carpetas de cuarentena previas.
-- `test_quarantine_restore.py`: Verificación del ciclo completo de Soft-Delete, estructura relativa de directorios, generación de `manifest.json` y restauración exacta bit a bit.
+- `test_quarantine_restore.py`: Verificación del ciclo completo de Soft-Delete, estructura relativa de directorios, generación de `manifest.json`, restauración exacta bit a bit, purgado de sesiones y eliminación directa/papelera.
+
+---
+
+## 8. Modos de Limpieza y Gestión de Duplicados
+
+DataCleaner ofrece tres esquemas flexibles de mitigación de redundancias:
+
+1. **Opción Recomendada: Aislamiento en Cuarentena y Purgado Diferido (Vaciar Cuarentena)**
+   - **Fase 1 (Aislamiento):** Los archivos duplicados se trasladan de forma no destructiva a `./_quarantine_timestamp/`, manteniendo el árbol de directorios original y creando un `manifest.json`.
+   - **Fase 2 (Restauración o Purgado):** Mediante el modal interactivo de la GUI o el botón *"Vaciar Cuarentena (Purgar)"*, el usuario puede restaurar los archivos a su origen o destruir definitivamente la carpeta de cuarentena una vez confirmado el buen funcionamiento del sistema (`purge_quarantine_session()`).
+   - CLI: `datacleaner purge <directorio>`
+
+2. **Opción Directa: Eliminación Permanente (Irreversible)**
+   - Borrado inmediato de disco mediante `Path.unlink()` sobre los archivos redundantes sin generar carpetas de cuarentena.
+   - Requiere confirmación explícita mediante diálogo crítico de advertencia en la GUI o la bandera `--permanent` en CLI.
+
+3. **Papelera de Reciclaje de Windows (`send2trash`)**
+   - Elimina el archivo de su directorio de origen liberando espacio de inmediato, pero enviándolo a la Papelera de Reciclaje nativa del sistema operativo.
+   - Permite recuperar cualquier archivo directamente desde la papelera de Windows sin requerir restauraciones manuales.
+

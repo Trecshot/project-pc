@@ -32,6 +32,7 @@ htmlcov/
 # DataCleaner Quarantines and Temporary Reports
 _quarantine_*/
 report*.json
+.datacleaner_history.json
 
 # IDE / Editor
 .vscode/

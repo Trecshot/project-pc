@@ -16,15 +16,18 @@ from datacleaner.rules import select_file_to_keep, KeepRule
 from datacleaner.scanner import ScanSummary
 
 def format_bytes(bytes_count: int) -> str:
-    """Convierte bytes a formato legible (B, KB, MB, GB, TB)."""
+    """Convierte bytes a formato legible (B, KB, MB, GB, TB) escalando automáticamente."""
     if bytes_count <= 0:
         return "0 B"
-    units = ["B", "KB", "MB", "GB", "TB"]
-    i = int(math.floor(math.log(bytes_count, 1024)))
-    p = math.pow(1024, i)
-    s = round(bytes_count / p, 2)
-    unit = units[i] if i < len(units) else "PB"
-    return f"{s} {unit}"
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    val = float(bytes_count)
+    idx = 0
+    while val >= 1000.0 and idx < len(units) - 1:
+        val /= 1024.0
+        idx += 1
+    if idx == 0:
+        return f"{int(val)} B"
+    return f"{round(val, 2)} {units[idx]}"
 
 def build_audit_plan(
     duplicates: dict[str, list[Path]],

@@ -17,6 +17,12 @@ import os
 import math
 from dataclasses import dataclass, asdict
 
+try:
+    from send2trash import send2trash
+    HAS_SEND2TRASH = True
+except ImportError:
+    HAS_SEND2TRASH = False
+
 @dataclass
 class QuarantineItem:
     original_path: str
@@ -47,16 +53,27 @@ class RestoreResult:
     quarantine_folder_removed: bool
     errors: list[str]
 
+@dataclass
+class DeleteResult:
+    total_deleted: int
+    total_bytes_deleted: int
+    used_trash: bool
+    deleted_paths: list[str]
+    errors: list[str]
+
 def _format_bytes(bytes_count: int) -> str:
-    """Convierte bytes a formato legible (B, KB, MB, GB)."""
+    """Convierte bytes a formato legible (B, KB, MB, GB, TB) escalando automáticamente."""
     if bytes_count <= 0:
         return "0 B"
-    units = ["B", "KB", "MB", "GB", "TB"]
-    i = int(math.floor(math.log(bytes_count, 1024)))
-    p = math.pow(1024, i)
-    s = round(bytes_count / p, 2)
-    unit = units[i] if i < len(units) else "PB"
-    return f"{s} {unit}"
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    val = float(bytes_count)
+    idx = 0
+    while val >= 1000.0 and idx < len(units) - 1:
+        val /= 1024.0
+        idx += 1
+    if idx == 0:
+        return f"{int(val)} B"
+    return f"{round(val, 2)} {units[idx]}"
 
 def create_quarantine_directory(base_dir: Path, custom_parent: Path | None = None) -> tuple[Path, str, str]:
     """
@@ -335,3 +352,92 @@ def restore_from_quarantine(manifest_path: Path | str) -> RestoreResult:
         quarantine_folder_removed=quarantine_folder_removed,
         errors=errors
     )
+
+def purge_quarantine_session(quarantine_dir: Path | str) -> bool:
+    """
+    Elimina definitivamente la carpeta de cuarentena y su contenido completo.
+    Incorpora validaciones de seguridad: verifica existencia y prefijo '_quarantine_'.
+    """
+    q_dir = Path(quarantine_dir).resolve().absolute()
+    if not q_dir.exists() or not q_dir.is_dir():
+        return False
+
+    if not q_dir.name.startswith("_quarantine_"):
+        raise ValueError(f"Ruta de cuarentena no válida o fuera del ámbito protegido: {q_dir.name}")
+
+    shutil.rmtree(q_dir)
+    return True
+
+def purge_all_quarantine_sessions(base_dir: Path | str) -> int:
+    """
+    Elimina definitivamente todas las carpetas de cuarentena en base_dir.
+    Retorna la cantidad de sesiones eliminadas.
+    """
+    sessions = find_quarantine_sessions(base_dir)
+    purged_count = 0
+    for s in sessions:
+        if purge_quarantine_session(s["folder_path"]):
+            purged_count += 1
+    return purged_count
+
+def delete_redundant_files(
+    redundant_paths: list[Path | str],
+    use_trash: bool = False
+) -> DeleteResult:
+    """
+    Elimina los archivos duplicados del disco (permanentemente o enviándolos a la Papelera de Windows).
+
+    Args:
+        redundant_paths: Lista de rutas a eliminar.
+        use_trash: Si es True, envía a la Papelera mediante send2trash.
+                   Si es False, desvincula permanentemente con unlink()/os.remove().
+    """
+    deleted_paths: list[str] = []
+    errors: list[str] = []
+    total_deleted = 0
+    total_bytes_deleted = 0
+
+    for path_item in redundant_paths:
+        p = Path(path_item).resolve().absolute()
+        if not p.exists():
+            continue
+        try:
+            file_size = p.stat().st_size
+            if use_trash:
+                if HAS_SEND2TRASH:
+                    send2trash(str(p))
+                else:
+                    p.unlink()
+            else:
+                p.unlink()
+
+            total_deleted += 1
+            total_bytes_deleted += file_size
+            deleted_paths.append(str(p))
+        except OSError as e:
+            errors.append(f"Error al eliminar {p}: {e}")
+        except Exception as e:
+            errors.append(f"Error inesperado al procesar {p}: {e}")
+
+    return DeleteResult(
+        total_deleted=total_deleted,
+        total_bytes_deleted=total_bytes_deleted,
+        used_trash=use_trash,
+        deleted_paths=deleted_paths,
+        errors=errors
+    )
+
+def execute_deletion_plan(
+    quarantine_plan: list[dict],
+    use_trash: bool = False
+) -> DeleteResult:
+    """
+    Ejecuta el borrado directo (papelera o definitivo) a partir de un plan de auditoría.
+    Extrae los archivos marcados como redundantes para eliminación.
+    """
+    all_redundant: list[Path] = []
+    for group in quarantine_plan:
+        all_redundant.extend(group.get("quarantine", []))
+
+    return delete_redundant_files(all_redundant, use_trash=use_trash)
+

@@ -19,7 +19,12 @@ from datacleaner.scanner import scan_directory_for_duplicates
 from datacleaner.rules import KeepRule
 from datacleaner.quarantine import (
     quarantine_redundant_files,
-    restore_from_quarantine
+    restore_from_quarantine,
+    find_quarantine_sessions,
+    purge_quarantine_session,
+    purge_all_quarantine_sessions,
+    execute_deletion_plan,
+    DeleteResult
 )
 from datacleaner.reporter import (
     build_audit_plan,
@@ -115,6 +120,32 @@ def cmd_quarantine(args: argparse.Namespace):
         console.print("[green]No hay archivos redundantes para mover.[/green]")
         return
 
+    # Opción 2 y 3: Eliminación directa (Papelera o Permanente)
+    if getattr(args, "direct", False):
+        use_trash = getattr(args, "trash", False) or not getattr(args, "permanent", False)
+        if getattr(args, "permanent", False):
+            use_trash = False
+
+        action_desc = "a la Papelera de Reciclaje" if use_trash else "definitivamente del disco (IRREVERSIBLE)"
+        if not args.yes:
+            confirm = Confirm.ask(
+                f"[bold yellow]¿Confirmar eliminación {action_desc} de {total_redundant} archivos?[/bold yellow]",
+                default=False
+            )
+            if not confirm:
+                console.print("[dim]Operación cancelada por el usuario.[/dim]")
+                return
+
+        plan = build_audit_plan(duplicates, keep_rule=args.keep_rule)
+        del_res = execute_deletion_plan(plan, use_trash=use_trash)
+        console.print(f"\n[bold green][OK] Eliminación directa finalizada.[/bold green]")
+        console.print(f"  * Archivos eliminados: [bold]{del_res.total_deleted}[/bold] ({format_bytes(del_res.total_bytes_deleted)})")
+        console.print(f"  * Modo: {'Papelera de Reciclaje (send2trash)' if del_res.used_trash else 'Permanente (unlink)'}")
+        if del_res.errors:
+            for err in del_res.errors:
+                console.print(f"  - [red]{err}[/red]")
+        return
+
     # Principio 1.2: Ninguna operación destructiva/modificatoria sin aprobación
     if not args.yes:
         confirm = Confirm.ask(
@@ -176,6 +207,35 @@ def cmd_restore(args: argparse.Namespace):
             console.print(f"  - [red]{err}[/red]")
     console.print()
 
+def cmd_purge(args: argparse.Namespace):
+    """Opción 1: Purga definitivamente las carpetas de cuarentena."""
+    try:
+        target_dir = validate_target_path(args.path)
+    except Exception as e:
+        console.print(f"[bold red]Error de validación de seguridad:[/bold red] {e}")
+        sys.exit(1)
+
+    sessions = find_quarantine_sessions(target_dir)
+    if not sessions:
+        console.print(f"[yellow]No se encontraron sesiones de cuarentena (_quarantine_*) en: {target_dir}[/yellow]")
+        return
+
+    console.print(f"\n[cyan]Se encontraron {len(sessions)} sesión(es) de cuarentena en:[/cyan] [bold]{target_dir}[/bold]")
+    for idx, s in enumerate(sessions, 1):
+        console.print(f"  {idx}. [bold]{s['session_id']}[/bold] - {s['total_files']} archivos ({s['total_bytes_formatted']}) [{s['timestamp']}]")
+
+    if not args.yes:
+        confirm = Confirm.ask(
+            "\n[bold red]¿Confirmar ELIMINACIÓN PERMANENTE (purgar) de estas sesiones de cuarentena?[/bold red]",
+            default=False
+        )
+        if not confirm:
+            console.print("[dim]Operación cancelada por el usuario. No se modificó ningún archivo.[/dim]")
+            return
+
+    purged = purge_all_quarantine_sessions(target_dir)
+    console.print(f"\n[bold green][OK] Se purgaron {purged} sesión(es) de cuarentena definitivamente.[/bold green]\n")
+
 def cmd_gui(args: argparse.Namespace):
     """Abre la interfaz gráfica de usuario de escritorio (GUI)."""
     try:
@@ -218,12 +278,21 @@ def main():
     quar_parser.add_argument("--workers", type=int, default=4, help="Número de hilos de trabajo")
     quar_parser.add_argument("-y", "--yes", action="store_true", help="Omitir confirmación manual interactiva")
     quar_parser.add_argument("--quarantine-dir", help="Directorio destino personalizado para la cuarentena")
+    quar_parser.add_argument("--direct", action="store_true", help="Eliminar directamente sin enviar a cuarentena")
+    quar_parser.add_argument("--trash", action="store_true", help="Enviar a la Papelera de Windows (al usar --direct)")
+    quar_parser.add_argument("--permanent", action="store_true", help="Eliminar permanentemente del disco (al usar --direct)")
     quar_parser.set_defaults(func=cmd_quarantine)
 
     # Comando 'restore'
     rest_parser = subparsers.add_parser("restore", help="Restaurar archivos desde un archivo manifest.json")
     rest_parser.add_argument("manifest", help="Ruta al archivo manifest.json de la cuarentena")
     rest_parser.set_defaults(func=cmd_restore)
+
+    # Comando 'purge' (Opción 1: Vaciar / Purgar Cuarentenas)
+    purge_parser = subparsers.add_parser("purge", help="Vaciar/purgar definitivamente sesiones de cuarentena")
+    purge_parser.add_argument("path", help="Ruta del directorio auditado con carpetas de cuarentena")
+    purge_parser.add_argument("-y", "--yes", action="store_true", help="Omitir confirmación manual interactiva")
+    purge_parser.set_defaults(func=cmd_purge)
 
     # Comando 'gui'
     gui_parser = subparsers.add_parser("gui", help="Iniciar la Interfaz Gráfica de Usuario (GUI)")

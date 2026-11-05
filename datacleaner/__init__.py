@@ -10,8 +10,13 @@ from datacleaner.quarantine import (
     quarantine_redundant_files,
     restore_from_quarantine,
     find_quarantine_sessions,
+    purge_quarantine_session,
+    purge_all_quarantine_sessions,
+    delete_redundant_files,
+    execute_deletion_plan,
     QuarantineResult,
-    RestoreResult
+    RestoreResult,
+    DeleteResult
 )
 from datacleaner.reporter import (
     build_audit_plan,
@@ -19,6 +24,13 @@ from datacleaner.reporter import (
     print_rich_report,
     export_report_json,
     format_bytes
+)
+from datacleaner.history import (
+    CleaningHistoryManager,
+    HistoryEntry,
+    HistorySummary,
+    format_bytes_auto,
+    format_bytes_with_equivalence
 )
 
 __version__ = "1.0.0"
@@ -33,11 +45,21 @@ __all__ = [
     "quarantine_redundant_files",
     "restore_from_quarantine",
     "find_quarantine_sessions",
+    "purge_quarantine_session",
+    "purge_all_quarantine_sessions",
+    "delete_redundant_files",
+    "execute_deletion_plan",
     "QuarantineResult",
     "RestoreResult",
+    "DeleteResult",
     "build_audit_plan",
     "generate_report_dict",
     "print_rich_report",
     "export_report_json",
-    "format_bytes"
+    "format_bytes",
+    "CleaningHistoryManager",
+    "HistoryEntry",
+    "HistorySummary",
+    "format_bytes_auto",
+    "format_bytes_with_equivalence"
 ]
