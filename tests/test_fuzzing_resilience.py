@@ -21,16 +21,13 @@ from pathlib import Path
 
 from datacleaner.magic import (
     analyze_file_signature,
-    inspect_ooxml_container,
-    read_magic_header,
     FileSignatureReport,
 )
 from datacleaner.scanner import (
     scan_directory_for_duplicates,
-    iter_directory_files,
     ScanSummary,
 )
-from datacleaner.hasher import compute_partial_hash, HAS_XXHASH
+from datacleaner.hasher import compute_partial_hash
 from datacleaner.quarantine import _verify_file_unchanged
 from datacleaner.bloom import BloomFilter
 

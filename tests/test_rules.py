@@ -9,7 +9,7 @@ import os
 import shutil
 from pathlib import Path
 
-from datacleaner.rules import select_file_to_keep, KeepRule, calculate_path_cleanliness_score
+from datacleaner.rules import select_file_to_keep, KeepRule
 
 class TestKeepRules(unittest.TestCase):
     def setUp(self):

@@ -84,6 +84,28 @@ def _build_system_root_blacklist() -> set[str]:
 SYSTEM_ROOT_BLACKLIST = _build_system_root_blacklist()
 SYSTEM_BLACKLIST = _build_system_blacklist()
 
+
+# Listas de exclusión de desarrollo y entornos virtuales (Falla 1)
+PROTECTED_DEV_DIRS = {
+    ".git", ".svn", ".hg", "venv", ".venv", "env",
+    "site-packages", "node_modules", "__pycache__", ".pytest_cache"
+}
+
+STRUCTURAL_MARKER_FILES = {
+    "__init__.py", "py.typed", ".gitignore", ".gitkeep",
+    "REQUESTED", "INSTALLER", "WHEEL"
+}
+
+
+def is_protected_dev_resource(path: Path) -> bool:
+    """Evita que el escáner destruya entornos virtuales o paquetes."""
+    name_lower = path.name.lower()
+    if any(name_lower == marker.lower() for marker in STRUCTURAL_MARKER_FILES):
+        return True
+    parts_lower = {part.lower() for part in path.parts}
+    return any(dev_dir.lower() in parts_lower for dev_dir in PROTECTED_DEV_DIRS)
+
+
 def is_root_directory(target_path: Path) -> bool:
     """
     Determina si la ruta corresponde a una partición raíz o unidad completa de disco
@@ -106,6 +128,7 @@ def is_root_directory(target_path: Path) -> bool:
         return False
     except Exception:
         return True
+
 
 def _is_subpath(child: Path, parent: Path) -> bool:
     """
@@ -134,6 +157,7 @@ def _is_subpath(child: Path, parent: Path) -> bool:
         return False
     except Exception:
         return False
+
 
 def validate_target_path(target_path: str | Path, must_be_dir: bool = True) -> Path:
     """

@@ -16,8 +16,8 @@ import json
 import os
 from pathlib import Path
 
-from datacleaner.security import validate_target_path, SYSTEM_BLACKLIST
-from datacleaner.hasher import get_safe_worker_count, compute_file_hash
+from datacleaner.security import validate_target_path
+from datacleaner.hasher import get_safe_worker_count
 from datacleaner.scanner import scan_directory_for_duplicates, is_symlink_or_junction
 from datacleaner.quarantine import quarantine_redundant_files, restore_from_quarantine
 from datacleaner.reporter import build_audit_plan
@@ -63,12 +63,12 @@ class TestHardeningAndSecurity(unittest.TestCase):
         file_b.write_bytes(content)
 
         duplicates, summary = scan_directory_for_duplicates(self.base_path)
-        plan = build_audit_plan(duplicates)
+        _ = build_audit_plan(duplicates)
 
         # Forzar un plan donde ambos archivos intenten moverse al mismo directorio de destino
         quarantine_dir = self.base_path / "_quarantine_test"
         quarantine_dir.mkdir(parents=True, exist_ok=True)
-        
+
         # Simular conflicto forzado: ambos archivos van a la misma ruta relativa en cuarentena
         forced_plan = [{
             "hash": list(duplicates.keys())[0],
@@ -77,7 +77,7 @@ class TestHardeningAndSecurity(unittest.TestCase):
         }]
 
         result = quarantine_redundant_files(self.base_path, forced_plan, custom_quarantine_dir=quarantine_dir)
-        
+
         # Ambos deben haberse movido sin que el segundo sobrescriba al primero
         self.assertEqual(result.total_moved, 2)
         quarantined_files = list(quarantine_dir.rglob("*.pdf"))

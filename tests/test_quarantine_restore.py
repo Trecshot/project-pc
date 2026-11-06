@@ -18,13 +18,10 @@ from datacleaner.quarantine import (
     find_quarantine_sessions,
     purge_quarantine_session,
     purge_all_quarantine_sessions,
-    delete_redundant_files,
     execute_deletion_plan,
     deduplicate_with_hardlinks,
     QuarantineResult,
     RestoreResult,
-    DeleteResult,
-    HardlinkResult,
 )
 from datacleaner.history import (
     CleaningHistoryManager,

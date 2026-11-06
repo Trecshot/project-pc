@@ -32,6 +32,7 @@ from datacleaner.hasher import (
 from datacleaner.magic import analyze_file_signature, FileSignatureReport
 from datacleaner.bloom import BloomFilter
 from datacleaner.history import CleaningHistoryManager
+from datacleaner.security import is_protected_dev_resource
 
 logger = logging.getLogger(__name__)
 
@@ -67,8 +68,9 @@ class ScanSummary:
 
 
 PROTECTED_DIR_NAMES = {
-    ".git", ".svn", ".hg", "__pycache__", ".venv", "venv",
-    "$recycle.bin", "system volume information", "node_modules", "appdata"
+    ".git", ".svn", ".hg", "__pycache__", ".venv", "venv", "env",
+    "$recycle.bin", "system volume information", "node_modules", "appdata",
+    "site-packages", ".pytest_cache"
 }
 
 
@@ -117,6 +119,10 @@ def iter_directory_files(base_dir: Path, on_warning: Callable[[str], None] | Non
             for f in files:
                 file_path = root_path / f
 
+                # CORRECCIÓN CRÍTICA 1: Proteger archivos estructurales y entornos virtuales
+                if is_protected_dev_resource(file_path):
+                    continue
+
                 if is_symlink_or_junction(file_path):
                     continue
 
@@ -144,6 +150,7 @@ def scan_directory_for_duplicates(
     history_manager: CleaningHistoryManager | None = None,
     cancel_event: threading.Event | None = None,
     bloom_filter: BloomFilter | None = None,
+    include_empty_files: bool = False,
 ) -> tuple[dict[str, list[Path]], ScanSummary]:
     """
     Motor nativo de escaneo Multi-Stage de alto rendimiento:
@@ -174,10 +181,19 @@ def scan_directory_for_duplicates(
             log_warning("Auditoría cancelada por el usuario en Fase 1.")
             return {}, summary
 
-        summary.total_files_scanned += 1
+        # CORRECCIÓN CRÍTICA 1: Proteger archivos estructurales y entornos virtuales
+        if is_protected_dev_resource(file_path):
+            continue
+
         try:
             stat = file_path.stat(follow_symlinks=False)
             file_size = stat.st_size
+
+            # CORRECCIÓN CRÍTICA 2: Ignorar archivos de 0 bytes por defecto
+            if file_size == 0 and not include_empty_files:
+                continue
+
+            summary.total_files_scanned += 1
             summary.total_bytes_scanned += file_size
 
             # Omitir archivos que ya comparten inodo físico (Hardlinks existentes)
@@ -433,6 +449,7 @@ async def scan_directory_async(
     use_cache: bool = True,
     history_manager: CleaningHistoryManager | None = None,
     cancel_event: threading.Event | None = None,
+    include_empty_files: bool = False,
 ) -> tuple[dict[str, list[Path]], ScanSummary]:
     """
     Interfaz asíncrona compatible con AsyncIO:
@@ -448,4 +465,5 @@ async def scan_directory_async(
         use_cache=use_cache,
         history_manager=history_manager,
         cancel_event=cancel_event,
+        include_empty_files=include_empty_files,
     )

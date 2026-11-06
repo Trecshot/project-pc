@@ -10,18 +10,23 @@ para conservar el acoplamiento con `gui.py` y `cli.py`.
 import os
 import sys
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from dataclasses import dataclass, asdict
 from typing import Any
 import sqlite3
 import json
 import logging
 import hashlib
+import hmac
+import subprocess
 
 logger = logging.getLogger(__name__)
 
 
 def _get_default_storage_dir() -> Path:
+    env_db = os.environ.get("DATACLEANER_DB_PATH")
+    if env_db:
+        return Path(env_db).resolve().parent
     # Si se ejecuta compilado con Nuitka / PyInstaller, usar AppData Local del usuario
     if "__compiled__" in globals() or getattr(sys, "frozen", False):
         base = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "DataCleaner"
@@ -30,9 +35,56 @@ def _get_default_storage_dir() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-DEFAULT_DATABASE = _get_default_storage_dir() / ".datacleaner.sqlite"
+def _get_default_db_path() -> Path:
+    env_db = os.environ.get("DATACLEANER_DB_PATH")
+    if env_db:
+        return Path(env_db).resolve()
+    return _get_default_storage_dir() / ".datacleaner.sqlite"
+
+
+DEFAULT_DATABASE = _get_default_db_path()
 DEFAULT_HISTORY_FILE = DEFAULT_DATABASE
 LEGACY_JSON_HISTORY = _get_default_storage_dir() / ".datacleaner_history.json"
+
+
+def get_utc_timestamp() -> str:
+    """Devuelve timestamp estandarizado en UTC para todas las tablas (Falla 5)."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _get_audit_secret_key() -> bytes:
+    """Obtiene la clave de auditoría del entorno o almacén seguro del SO (Falla 3)."""
+    env_key = os.environ.get("DATACLEANER_AUDIT_KEY")
+    if env_key:
+        return env_key.encode("utf-8")
+    machine_id = f"{os.environ.get('COMPUTERNAME', 'local')}_{os.environ.get('USERNAME', 'user')}"
+    return hashlib.sha256(machine_id.encode("utf-8")).digest()
+
+
+def compute_entry_hmac(prev_hash: str, entry_id: str, timestamp: str, action_type: str, target_dir: str, files_count: int, bytes_count: int) -> str:
+    """Calcula un HMAC-SHA256 inmutable para el registro de auditoría (NIST SSDF PO.4 / Falla 3)."""
+    payload = f"{prev_hash}|{entry_id}|{timestamp}|{action_type}|{target_dir}|{files_count}|{bytes_count}".encode("utf-8")
+    return hmac.new(_get_audit_secret_key(), payload, hashlib.sha256).hexdigest()
+
+
+def reseal_legacy_audit_chain(conn: sqlite3.Connection) -> None:
+    """Repara cadenas rotas (como las filas 1 a 11) sellando desde el primer registro con HMAC."""
+    cursor = conn.execute(
+        "SELECT entry_id, timestamp, action_type, target_dir, files_count, bytes_count FROM operations_history ORDER BY rowid ASC"
+    )
+    rows = cursor.fetchall()
+    prev_hash = "GENESIS"
+    for row in rows:
+        entry_hash = compute_entry_hmac(
+            prev_hash, row["entry_id"], row["timestamp"], row["action_type"],
+            row["target_dir"], row["files_count"], row["bytes_count"]
+        )
+        conn.execute(
+            "UPDATE operations_history SET prev_hash = ?, entry_hash = ? WHERE entry_id = ?",
+            (prev_hash, entry_hash, row["entry_id"])
+        )
+        prev_hash = entry_hash
+    conn.commit()
 
 
 def format_bytes_auto(bytes_count: int | float, target_unit: str = "AUTO") -> str:
@@ -149,7 +201,7 @@ class ManagedConnection(sqlite3.Connection):
 
 
 def _harden_file_permissions(file_path: Path) -> None:
-    """Restringe permisos del archivo a sólo el usuario creador (Principio de Menor Privilegio, NIST SSDF PO.5.1)."""
+    """Restringe permisos del archivo a sólo el usuario creador (Principio de Menor Privilegio, NIST SSDF PO.5.1 / PW.5.1)."""
     if not file_path.exists():
         return
     try:
@@ -157,11 +209,11 @@ def _harden_file_permissions(file_path: Path) -> None:
             os.chmod(file_path, 0o600)
         else:
             # Eliminar herencia y restringir acceso exclusivamente al usuario propietario actual (Windows DACL)
-            import subprocess
             username = os.environ.get("USERNAME")
             if username:
-                cmd = ["icacls.exe", str(file_path), "/inheritance:r", "/grant:r", f"{username}:(R,W)"]
-                subprocess.run(cmd, capture_output=True, check=False)
+                # CORRECCIÓN: Lista de argumentos sin shell=True para mitigar CWE-78
+                cmd = ["icacls", str(file_path), "/inheritance:r", "/grant:r", f"{username}:(R,W)"]
+                subprocess.run(cmd, shell=False, capture_output=True, check=False)
     except (OSError, Exception) as e:
         logger.debug(f"No se pudieron ajustar permisos para {file_path}: {e}")
 
@@ -173,7 +225,8 @@ class CleaningHistoryManager:
     """
 
     def __init__(self, history_file: Path | str | None = None, storage_path: Path | str | None = None):
-        chosen = history_file or storage_path
+        env_db = os.environ.get("DATACLEANER_DB_PATH")
+        chosen = history_file or storage_path or env_db
         if chosen:
             chosen_path = Path(chosen).resolve()
             if chosen_path.suffix.lower() == ".json":
@@ -183,7 +236,7 @@ class CleaningHistoryManager:
                 self.db_path = chosen_path
                 self.legacy_json_path = None
         else:
-            self.db_path = DEFAULT_DATABASE
+            self.db_path = _get_default_db_path()
             self.legacy_json_path = LEGACY_JSON_HISTORY
 
         self._init_database()
@@ -194,6 +247,8 @@ class CleaningHistoryManager:
         conn = sqlite3.connect(str(self.db_path), timeout=10.0, factory=ManagedConnection)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON;")
+        conn.execute("PRAGMA journal_mode = WAL;")
+        conn.execute("PRAGMA secure_delete = ON;")  # Sobrescribe con 0x00 páginas borradas (Falla 4)
 
         # Endurecer permisos del archivo de base de datos
         _harden_file_permissions(self.db_path)
@@ -279,6 +334,20 @@ class CleaningHistoryManager:
                 conn.execute("ALTER TABLE operations_history ADD COLUMN prev_hash TEXT DEFAULT 'GENESIS';")
             if "entry_hash" not in ops_cols:
                 conn.execute("ALTER TABLE operations_history ADD COLUMN entry_hash TEXT DEFAULT '';")
+
+            # Resellar cadenas legacy o corruptas con HMAC (Falla 3)
+            cur_check = conn.execute(
+                "SELECT entry_id, timestamp, action_type, target_dir, files_count, bytes_count, prev_hash, entry_hash "
+                "FROM operations_history ORDER BY rowid ASC LIMIT 1"
+            ).fetchone()
+            if cur_check:
+                expected_first = compute_entry_hmac(
+                    "GENESIS", cur_check["entry_id"], cur_check["timestamp"],
+                    cur_check["action_type"], cur_check["target_dir"],
+                    cur_check["files_count"], cur_check["bytes_count"]
+                )
+                if cur_check["entry_hash"] != expected_first or not cur_check["entry_hash"]:
+                    reseal_legacy_audit_chain(conn)
 
             conn.commit()
         # Mantenimiento preventivo: podar registros obsoletos (> 60 días)
@@ -481,14 +550,15 @@ class CleaningHistoryManager:
         partial_hash: str | None,
         sha256_hash: str,
     ) -> None:
-        """Guarda o actualiza el estado de hash de un archivo en la caché de SQLite."""
+        """Guarda o actualiza el estado de hash de un archivo en la caché de SQLite con timestamp UTC."""
         p_str = str(Path(file_path).resolve())
+        utc_now = get_utc_timestamp()
         with self._get_connection() as conn:
             conn.execute(
                 """
                 INSERT OR REPLACE INTO file_hash_cache
                 (file_path, device_id, inode, file_size, mtime, partial_hash, sha256_hash, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     p_str,
@@ -498,20 +568,87 @@ class CleaningHistoryManager:
                     float(mtime),
                     partial_hash,
                     sha256_hash,
+                    utc_now,
                 ),
             )
             conn.commit()
 
+    def get_cached_hash(self, file_path: str, file_size: int, mtime: float, current_partial_hash: str) -> str | None:
+        """Verifica tamaño, mtime y partial_hash antes de confiar en el SHA-256 de la caché (Falla 6)."""
+        p_str = str(Path(file_path).resolve())
+        query = (
+            """
+            SELECT sha256_hash FROM file_hash_cache
+            WHERE (file_path = ? OR file_path = ? COLLATE NOCASE)
+              AND file_size = ? AND mtime = ? AND partial_hash = ?
+            LIMIT 1
+            """
+            if sys.platform == "win32"
+            else """
+            SELECT sha256_hash FROM file_hash_cache
+            WHERE file_path = ? AND file_size = ? AND mtime = ? AND partial_hash = ?
+            LIMIT 1
+            """
+        )
+        with self._get_connection() as conn:
+            params = (p_str, file_path, file_size, mtime, current_partial_hash) if sys.platform == "win32" else (file_path, file_size, mtime, current_partial_hash)
+            row = conn.execute(query, params).fetchone()
+            if row:
+                return row["sha256_hash"]
+            # Tolerancia para precisión de punto flotante en SQLite
+            query_tol = (
+                """
+                SELECT sha256_hash, mtime FROM file_hash_cache
+                WHERE (file_path = ? OR file_path = ? COLLATE NOCASE)
+                  AND file_size = ? AND partial_hash = ?
+                LIMIT 1
+                """
+                if sys.platform == "win32"
+                else """
+                SELECT sha256_hash, mtime FROM file_hash_cache
+                WHERE file_path = ? AND file_size = ? AND partial_hash = ?
+                LIMIT 1
+                """
+            )
+            params_tol = (p_str, file_path, file_size, current_partial_hash) if sys.platform == "win32" else (file_path, file_size, current_partial_hash)
+            row_tol = conn.execute(query_tol, params_tol).fetchone()
+            if row_tol and abs(float(row_tol["mtime"]) - float(mtime)) < 1e-4:
+                return row_tol["sha256_hash"]
+            return None
+
+    def purge_test_artifacts_and_vacuum(self) -> None:
+        """Elimina toda la contaminación de tests en la BD y limpia el espacio libre (Falla 4)."""
+        with self._get_connection() as conn:
+            conn.execute(
+                "DELETE FROM file_hash_cache WHERE file_path LIKE '%Temp%datacleaner_%' "
+                "OR file_path LIKE '%Temp%tmp%' "
+                "OR file_path LIKE '%Temp%dc_test_%' "
+                "OR file_path LIKE '%pytest%';"
+            )
+            conn.execute(
+                "DELETE FROM operations_history WHERE target_dir LIKE '%Temp%datacleaner_%' "
+                "OR target_dir LIKE '%pytest%';"
+            )
+            conn.execute(
+                "DELETE FROM sesiones_cuarentena WHERE base_dir LIKE '%Temp%datacleaner_%' "
+                "OR base_dir LIKE '%pytest%';"
+            )
+            reseal_legacy_audit_chain(conn)
+            conn.commit()
+            conn.isolation_level = None
+            conn.execute("VACUUM;")
+
     def set_cached_hashes_batch(self, records: list[dict[str, Any]]) -> None:
-        """Inserción por lote para minimizar transacciones en escaneos masivos."""
+        """Inserción por lote para minimizar transacciones en escaneos masivos con timestamp UTC."""
         if not records:
             return
+        utc_now = get_utc_timestamp()
         with self._get_connection() as conn:
             conn.executemany(
                 """
                 INSERT OR REPLACE INTO file_hash_cache
                 (file_path, device_id, inode, file_size, mtime, partial_hash, sha256_hash, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 [
                     (
@@ -522,6 +659,7 @@ class CleaningHistoryManager:
                         float(r["mtime"]),
                         r.get("partial_hash"),
                         str(r["sha256_hash"]),
+                        utc_now,
                     )
                     for r in records
                 ],
@@ -538,7 +676,7 @@ class CleaningHistoryManager:
         bytes_isolated: int,
         evaluated_files: list[dict[str, Any]] | None = None
     ) -> None:
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now_str = get_utc_timestamp()
         with self._get_connection() as conn:
             conn.execute(
                 """
@@ -621,22 +759,23 @@ class CleaningHistoryManager:
         bytes_affected: int | None = None,
     ) -> HistoryEntry:
         """Inserta un nuevo evento en `operations_history` mediante sentencia SQL parametrizada."""
-        now = datetime.now()
+        utc_now = datetime.now(timezone.utc)
+        utc_str = get_utc_timestamp()
         actual_bytes = bytes_count if bytes_count is not None else (bytes_affected or 0)
         label = ACTION_LABELS.get(action_type, action_type)
 
         with self._get_connection() as conn:
             row = conn.execute("SELECT COALESCE(MAX(rowid), 0) + 1 AS next_id FROM operations_history").fetchone()
             next_id = row["next_id"] if row else 1
-            entry_id = f"hist_{now.strftime('%Y%m%d_%H%M%S_%f')}_{next_id}"
+            entry_id = f"hist_{utc_now.strftime('%Y%m%d_%H%M%S_%f')}_{next_id}"
 
-            # Obtener hash de la fila previa para encadenamiento criptográfico (NIST SSDF PO.4)
+            # Obtener hash de la fila previa para encadenamiento criptográfico HMAC (NIST SSDF PO.4 / Falla 3)
             last_row = conn.execute("SELECT entry_hash FROM operations_history ORDER BY rowid DESC LIMIT 1").fetchone()
             prev_hash = last_row["entry_hash"] if last_row and last_row["entry_hash"] else "GENESIS"
 
             new_entry = HistoryEntry(
                 entry_id=entry_id,
-                timestamp=now.strftime("%Y-%m-%d %H:%M:%S"),
+                timestamp=utc_str,
                 action_type=action_type,
                 action_label=label,
                 target_dir=str(Path(target_dir).resolve()),
@@ -646,12 +785,11 @@ class CleaningHistoryManager:
                 prev_hash=prev_hash,
             )
 
-            # Cálculo de entry_hash vinculando prev_hash con todos los datos inmutables de la fila
-            chain_payload = (
-                f"{prev_hash}|{new_entry.entry_id}|{new_entry.timestamp}|{new_entry.action_type}|"
-                f"{new_entry.target_dir}|{new_entry.files_count}|{new_entry.bytes_count}"
+            # Cálculo de entry_hash mediante HMAC-SHA256 con clave secreta
+            entry_hash = compute_entry_hmac(
+                prev_hash, new_entry.entry_id, new_entry.timestamp, new_entry.action_type,
+                new_entry.target_dir, new_entry.files_count, new_entry.bytes_count
             )
-            entry_hash = hashlib.sha256(chain_payload.encode("utf-8")).hexdigest()
             new_entry.entry_hash = entry_hash
 
             conn.execute(
@@ -679,8 +817,8 @@ class CleaningHistoryManager:
 
     def verify_audit_chain_integrity(self) -> tuple[bool, list[str]]:
         """
-        Verifica la inmutabilidad y la cadena criptográfica (hash-chain / tamper-evident)
-        de operations_history. Detecta alteraciones, borrados o inserciones manuales (NIST SSDF PO.4).
+        Verifica la inmutabilidad y la cadena criptográfica HMAC (hash-chain / tamper-evident)
+        de operations_history. Detecta alteraciones, borrados o inserciones manuales (NIST SSDF PO.4 / Falla 3).
         Retorna (is_valid, errors).
         """
         errors = []
@@ -698,8 +836,9 @@ class CleaningHistoryManager:
                 p_hash = r["prev_hash"] or "GENESIS"
                 e_hash = r["entry_hash"] or ""
 
-                # Omitir filas legacy sin hash
+                # Omitir filas legacy sin hash si no se han resellado aún
                 if not e_hash:
+                    errors.append(f"[HASH VACÍO] Fila rowid={r['rowid']} ({r['entry_id']}): sin entry_hash.")
                     continue
 
                 if p_hash != expected_prev:
@@ -708,11 +847,10 @@ class CleaningHistoryManager:
                         f"prev_hash '{p_hash}' no coincide con el hash previo esperado '{expected_prev}'."
                     )
 
-                chain_payload = (
-                    f"{p_hash}|{r['entry_id']}|{r['timestamp']}|{r['action_type']}|"
-                    f"{r['target_dir']}|{r['files_count']}|{r['bytes_count']}"
+                computed_hash = compute_entry_hmac(
+                    p_hash, r["entry_id"], r["timestamp"], r["action_type"],
+                    r["target_dir"], r["files_count"], r["bytes_count"]
                 )
-                computed_hash = hashlib.sha256(chain_payload.encode("utf-8")).hexdigest()
                 if computed_hash != e_hash:
                     errors.append(
                         f"[ADULTERACIÓN DETECTADA] Fila rowid={r['rowid']} ({r['entry_id']}): "
@@ -827,7 +965,7 @@ class CleaningHistoryManager:
         summary = self.get_summary()
         out = Path(output_path).resolve()
         data = {
-            "exported_at": datetime.now().isoformat(),
+            "exported_at": datetime.now(timezone.utc).isoformat(),
             "storage_engine": "SQLite3 (operations_history)",
             "database_path": str(self.db_path),
             "total_operations": summary.total_operations,

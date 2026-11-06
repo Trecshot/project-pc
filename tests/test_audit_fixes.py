@@ -27,7 +27,6 @@ from datacleaner.quarantine import (
     quarantine_redundant_files,
     delete_redundant_files,
     deduplicate_with_hardlinks,
-    _verify_file_unchanged,
 )
 from datacleaner.history import CleaningHistoryManager, format_bytes_auto
 from datacleaner.scheduler import build_schtasks_create_command
