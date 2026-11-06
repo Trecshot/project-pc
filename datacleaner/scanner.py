@@ -2,32 +2,38 @@
 Motor de Escaneo y Detección de Duplicados de Máximo Rendimiento
 DataCleaner CLI/GUI
 
-Mejoras Arquitectónicas Integradas:
+Optimizaciones Integradas:
 1. Caché de Estado Hashed (Stateful Caching en SQLite O(1)):
    Reutiliza hashes SHA-256 persistidos en .datacleaner.sqlite verificando (st_dev, st_ino, st_mtime, st_size).
-2. Filtro de Bloom Probabilístico en RAM:
-   Descarta archivos con st_size único inmediatamente antes de asignar estructuras en memoria.
-3. E/S Asíncrona (AsyncIO + aiofiles):
-   Non-blocking I/O con Event Loop y Semaphore regulado para saturar buses de alta velocidad (NVMe/SSD).
+2. Filtrado Instantáneo O(1) en RAM:
+   Descarta archivos con st_size único inmediatamente en conjuntos nativos en C antes de tocar el disco.
+3. Concurrencia Nativa con ThreadPoolExecutor:
+   Lectura síncrona optimizada por bloques en hilos trabajadores nativos del sistema donde file.read y
+   hashlib liberan el GIL en C, saturando el ancho de banda del bus de almacenamiento (SSD/NVMe).
+4. Cancelación Cooperativa y Zero Doble-Lectura:
+   Soporte para interrupción interactiva (cancel_event) y persistencia de firmas forenses (Magic Numbers).
 """
 
 from pathlib import Path
-import asyncio
 import os
+import asyncio
+import threading
+import logging
 from dataclasses import dataclass, field
 from typing import Callable, Generator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from datacleaner.hasher import (
     compute_file_hash,
     compute_partial_hash,
-    compute_file_hash_async,
-    compute_partial_hash_async,
     get_safe_worker_count,
     DEFAULT_CHUNK_SIZE,
 )
 from datacleaner.magic import analyze_file_signature, FileSignatureReport
 from datacleaner.bloom import BloomFilter
 from datacleaner.history import CleaningHistoryManager
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -50,7 +56,9 @@ class ScanSummary:
     cache_hits: int = 0
     cache_misses: int = 0
     bloom_unique_discarded: int = 0
-    async_io_enabled: bool = True
+    size_unique_discarded: int = 0
+    async_io_enabled: bool = False
+    cancelled: bool = False
     # Telemetría de Integridad por Firmas Binarias (Magic Numbers)
     spoofed_extensions_count: int = 0
     signature_anomalies: list[dict] = field(default_factory=list)
@@ -126,20 +134,23 @@ def iter_directory_files(base_dir: Path, on_warning: Callable[[str], None] | Non
         return
 
 
-async def scan_directory_async(
+def scan_directory_for_duplicates(
     base_dir: Path,
     max_workers: int | None = None,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     progress_callback: Callable[[int, int, str], None] | None = None,
     warning_callback: Callable[[str], None] | None = None,
     use_cache: bool = True,
-    history_manager: CleaningHistoryManager | None = None
+    history_manager: CleaningHistoryManager | None = None,
+    cancel_event: threading.Event | None = None,
+    bloom_filter: BloomFilter | None = None,
 ) -> tuple[dict[str, list[Path]], ScanSummary]:
     """
-    Motor asíncrono de escaneo con Event Loop no bloqueante (AsyncIO + aiofiles):
-    - Filtrado de tamaños únicos en RAM con complejidad O(1) y huella mínima.
-    - Caché SQLite transaccional pre-cargada en memoria para omitir I/O sin bloquear el loop.
-    - Concurrencia masiva regulada por asyncio.Semaphore.
+    Motor nativo de escaneo Multi-Stage de alto rendimiento:
+    - Fase 1: Agrupación instantánea por st_size en memoria RAM con Filtro de Bloom (O(1)).
+    - Fase 2: Fast-Hash en hilos de trabajo nativos (ThreadPoolExecutor) con consulta SQLite O(1).
+    - Fase 3: SHA-256 criptográfico solo sobre colisiones confirmadas, liberando el GIL en C.
+    - Soporta cancelación interactiva mediante cancel_event (MED-01).
     """
     summary = ScanSummary(base_dir=base_dir)
     hist_mgr = history_manager or (CleaningHistoryManager() if use_cache else None)
@@ -150,14 +161,19 @@ async def scan_directory_async(
             warning_callback(msg)
 
     # =========================================================================
-    # FASE 1: Recorrido O(1) en RAM + Detección de Hardlinks (Zero Disk Reads)
+    # FASE 1: Recorrido O(1) en RAM + Detección de Hardlinks con Filtro de Bloom
     # =========================================================================
-    seen_sizes: set[int] = set()
+    bloom = bloom_filter or BloomFilter(expected_elements=1_000_000, false_positive_rate=0.005)
     pending_unique: dict[int, Path] = {}
     colliding_size_map: dict[int, list[Path]] = {}
     seen_inodes_per_size: dict[int, set[tuple[int, int]]] = {}
 
     for file_path in iter_directory_files(base_dir, on_warning=log_warning):
+        if cancel_event and cancel_event.is_set():
+            summary.cancelled = True
+            log_warning("Auditoría cancelada por el usuario en Fase 1.")
+            return {}, summary
+
         summary.total_files_scanned += 1
         try:
             stat = file_path.stat(follow_symlinks=False)
@@ -173,26 +189,32 @@ async def scan_directory_async(
                     continue
                 inodes_set.add(inode_key)
 
-            # Clasificación O(1): Si el tamaño nunca se ha visto, se reserva en pending_unique.
-            # Solo si aparece otro archivo con el mismo tamaño se promueve a colliding_size_map.
-            if file_size not in seen_sizes:
-                seen_sizes.add(file_size)
+            # Clasificación O(1) mediante Filtro de Bloom en RAM:
+            # 1. Si file_size NO está en el filtro de Bloom (cero falsos negativos),
+            #    es 100% seguro la primera vez que se observa. Se agrega al filtro y a pending_unique.
+            if file_size not in bloom:
+                bloom.add(file_size)
                 pending_unique[file_size] = file_path
             else:
+                # 2. El filtro de Bloom indica que el tamaño ya fue visto (potencial colisión).
                 if file_size in pending_unique:
                     first_fp = pending_unique.pop(file_size)
                     colliding_size_map[file_size] = [first_fp, file_path]
                 elif file_size in colliding_size_map:
                     colliding_size_map[file_size].append(file_path)
+                else:
+                    # Falso positivo infrecuente de Bloom (<0.5%): registrar como primer elemento real
+                    pending_unique[file_size] = file_path
 
         except (PermissionError, OSError) as e:
             summary.unreadable_files_count += 1
             log_warning(f"No se pudieron leer metadatos de '{file_path}': {e}")
             continue
 
-    summary.bloom_unique_discarded = len(pending_unique)
+    unique_discarded = len(pending_unique)
+    summary.size_unique_discarded = unique_discarded
+    summary.bloom_unique_discarded = unique_discarded
     pending_unique.clear()
-    seen_sizes.clear()
 
     candidate_files: list[Path] = []
     for f_size, paths in colliding_size_map.items():
@@ -204,77 +226,89 @@ async def scan_directory_async(
     if total_candidates == 0:
         return {}, summary
 
-    # Semáforo para controlar descriptores abiertos concurrentes sin saturar el SO
-    safe_concurrency = max(4, min(get_safe_worker_count(max_workers) * 8, 128))
-    io_semaphore = asyncio.Semaphore(safe_concurrency)
+    workers = get_safe_worker_count(max_workers)
 
     # =========================================================================
-    # FASE 2: Fast-Hash Asíncrono con Verificación en Caché SQLite
+    # FASE 2: Fast-Hash con Verificación en Caché SQLite (ThreadPoolExecutor)
     # =========================================================================
     partial_map: dict[tuple[int, str], list[Path]] = {}
     cached_sha_map: dict[Path, str] = {}
     new_cache_entries: list[dict] = []
     computed_partial_hashes: dict[Path, str] = {}
 
-    # Pre-carga de caché en lote en memoria para búsquedas O(1) sin bloquear el Event Loop
     cached_data = hist_mgr.load_cache_for_directory(base_dir) if hist_mgr and hasattr(hist_mgr, "load_cache_for_directory") else None
 
-    async def _async_phase2(fp: Path) -> tuple[int, str | None, Path]:
-        async with io_semaphore:
-            try:
-                st = fp.stat(follow_symlinks=False)
-                f_size = st.st_size
-                st_dev = getattr(st, "st_dev", 0)
-                st_ino = getattr(st, "st_ino", 0)
-                st_mtime = st.st_mtime
-            except OSError:
-                return 0, None, fp
+    def _worker_phase2(fp: Path) -> tuple[int, str | None, str | None, Path, bool]:
+        try:
+            st = fp.stat(follow_symlinks=False)
+            f_size = st.st_size
+            st_dev = getattr(st, "st_dev", 0)
+            st_ino = getattr(st, "st_ino", 0)
+            st_mtime = st.st_mtime
+        except OSError:
+            return 0, None, None, fp, False
 
-            # 1. Consulta en Caché de Estado O(1) en memoria (sin llamadas bloqueantes a SQLite)
-            if cached_data:
-                entry = None
-                if st_ino and str(st_ino) != "0":
-                    entry = cached_data["by_inode"].get((str(st_dev), str(st_ino)))
-                if not entry:
-                    entry = cached_data["by_path"].get(str(fp.resolve()))
-                if entry and abs(entry["mtime"] - st_mtime) < 1e-4 and entry["file_size"] == f_size:
-                    c_part = entry["partial_hash"]
-                    c_sha = entry["sha256_hash"]
-                    if c_sha and c_part and len(c_part) == 32:
-                        summary.cache_hits += 1
-                        cached_sha_map[fp] = c_sha
-                        computed_partial_hashes[fp] = c_part
-                        return f_size, c_part, fp
-            elif hist_mgr:
-                c_part, c_sha = hist_mgr.get_cached_file_hash(fp, st_dev, st_ino, st_mtime, f_size)
+        # Consulta en Caché de Estado O(1) en memoria (sin llamadas bloqueantes a SQLite)
+        if cached_data:
+            entry = None
+            if st_ino and str(st_ino) != "0":
+                entry = cached_data["by_inode"].get((str(st_dev), str(st_ino)))
+            if not entry:
+                norm_p = os.path.normcase(str(fp.resolve()))
+                entry = cached_data["by_path"].get(norm_p) or cached_data["by_path"].get(str(fp.resolve()))
+            if entry and abs(entry["mtime"] - st_mtime) < 1e-4 and entry["file_size"] == f_size:
+                c_part = entry["partial_hash"]
+                c_sha = entry["sha256_hash"]
                 if c_sha and c_part and len(c_part) == 32:
-                    summary.cache_hits += 1
-                    cached_sha_map[fp] = c_sha
-                    computed_partial_hashes[fp] = c_part
-                    return f_size, c_part, fp
+                    return f_size, c_part, c_sha, fp, True
+        elif hist_mgr:
+            c_part, c_sha = hist_mgr.get_cached_file_hash(fp, st_dev, st_ino, st_mtime, f_size)
+            if c_sha and c_part and len(c_part) == 32:
+                return f_size, c_part, c_sha, fp, True
 
-            summary.cache_misses += 1
-            # 2. Lectura Asíncrona con aiofiles (primer y último chunk 64 KB)
-            p_hash = await compute_partial_hash_async(fp, chunk_size=chunk_size, on_error=log_warning)
-            if p_hash:
-                computed_partial_hashes[fp] = p_hash
-            return f_size, p_hash, fp
+        p_hash = compute_partial_hash(fp, chunk_size=chunk_size, on_error=log_warning)
+        return f_size, p_hash, None, fp, False
 
-    p2_tasks = [_async_phase2(fp) for fp in candidate_files]
     p2_done = 0
-    for coro in asyncio.as_completed(p2_tasks):
-        f_size, p_hash, f_path = await coro
-        p2_done += 1
-        summary.partial_hash_evaluated += 1
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(_worker_phase2, fp): fp for fp in candidate_files}
+        for future in as_completed(futures):
+            if cancel_event and cancel_event.is_set():
+                summary.cancelled = True
+                for fut in futures:
+                    fut.cancel()
+                log_warning("Auditoría cancelada por el usuario en Fase 2.")
+                return {}, summary
 
-        if progress_callback:
-            pct_step = max(1, int(p2_done * 0.4))
-            progress_callback(pct_step, total_candidates, f"[Fase 2 Fast-Hash Async] {f_path.name}")
+            try:
+                f_size, p_hash, c_sha, f_path, is_cache_hit = future.result()
+            except Exception as exc:
+                summary.unreadable_files_count += 1
+                log_warning(f"Error procesando Fast-Hash: {exc}")
+                continue
 
-        if p_hash is not None:
-            partial_map.setdefault((f_size, p_hash), []).append(f_path)
-        else:
-            summary.unreadable_files_count += 1
+            p2_done += 1
+            summary.partial_hash_evaluated += 1
+
+            if is_cache_hit:
+                summary.cache_hits += 1
+                if c_sha:
+                    cached_sha_map[f_path] = c_sha
+                if p_hash:
+                    computed_partial_hashes[f_path] = p_hash
+            else:
+                summary.cache_misses += 1
+                if p_hash:
+                    computed_partial_hashes[f_path] = p_hash
+
+            if progress_callback:
+                pct_step = max(1, int((p2_done / total_candidates) * 40))
+                progress_callback(pct_step, total_candidates, f"[Fase 2 Fast-Hash] {f_path.name}")
+
+            if p_hash is not None:
+                partial_map.setdefault((f_size, p_hash), []).append(f_path)
+            else:
+                summary.unreadable_files_count += 1
 
     phase2_survivors: list[Path] = []
     for (_f_size, _p_hash), paths in partial_map.items():
@@ -288,54 +322,71 @@ async def scan_directory_async(
         return {}, summary
 
     # =========================================================================
-    # FASE 3: SHA-256 Asíncrono Completo + Actualización de Caché
+    # FASE 3: SHA-256 Completo en Hilos Nativos (Zero GIL Contention)
     # =========================================================================
     hash_map: dict[str, list[Path]] = {}
 
-    async def _async_phase3(fp: Path) -> tuple[str | None, Path]:
-        # Si ya teníamos el SHA-256 desde la caché en Fase 2, lo retornamos inmediatamente
+    def _worker_phase3(fp: Path) -> tuple[str | None, Path, dict | None]:
         if fp in cached_sha_map:
-            return cached_sha_map[fp], fp
+            return cached_sha_map[fp], fp, None
 
-        async with io_semaphore:
-            res_hash = await compute_file_hash_async(fp, chunk_size=chunk_size, on_error=log_warning)
-            if res_hash and hist_mgr:
-                try:
-                    st = fp.stat(follow_symlinks=False)
-                    new_cache_entries.append({
-                        "file_path": str(fp.resolve()),
-                        "device_id": getattr(st, "st_dev", 0),
-                        "inode": getattr(st, "st_ino", 0),
-                        "file_size": st.st_size,
-                        "mtime": st.st_mtime,
-                        "partial_hash": computed_partial_hashes.get(fp),
-                        "sha256_hash": res_hash,
-                    })
-                except OSError:
-                    pass
-            return res_hash, fp
+        res_hash = compute_file_hash(fp, chunk_size=chunk_size, on_error=log_warning)
+        cache_entry = None
+        if res_hash and hist_mgr:
+            try:
+                st = fp.stat(follow_symlinks=False)
+                cache_entry = {
+                    "file_path": str(fp.resolve()),
+                    "device_id": getattr(st, "st_dev", 0),
+                    "inode": getattr(st, "st_ino", 0),
+                    "file_size": st.st_size,
+                    "mtime": st.st_mtime,
+                    "partial_hash": computed_partial_hashes.get(fp),
+                    "sha256_hash": res_hash,
+                }
+            except OSError:
+                pass
+        return res_hash, fp, cache_entry
 
-    p3_tasks = [_async_phase3(fp) for fp in phase2_survivors]
     p3_done = 0
-    for coro in asyncio.as_completed(p3_tasks):
-        res_hash, f_path = await coro
-        p3_done += 1
-        summary.full_hash_evaluated += 1
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures_p3 = {executor.submit(_worker_phase3, fp): fp for fp in phase2_survivors}
+        for future in as_completed(futures_p3):
+            if cancel_event and cancel_event.is_set():
+                summary.cancelled = True
+                for fut in futures_p3:
+                    fut.cancel()
+                log_warning("Auditoría cancelada por el usuario en Fase 3.")
+                return {}, summary
 
-        if progress_callback:
-            progress_callback(p3_done, total_phase3, f"[Fase 3 Async SHA-256] {f_path.name}")
+            try:
+                res_hash, f_path, c_entry = future.result()
+            except Exception as exc:
+                summary.unreadable_files_count += 1
+                log_warning(f"Error procesando SHA-256: {exc}")
+                continue
 
-        if res_hash:
-            hash_map.setdefault(res_hash, []).append(f_path)
-        else:
-            summary.unreadable_files_count += 1
+            p3_done += 1
+            summary.full_hash_evaluated += 1
+
+            if c_entry:
+                new_cache_entries.append(c_entry)
+
+            if progress_callback:
+                pct_step = 40 + max(1, int((p3_done / total_phase3) * 60))
+                progress_callback(pct_step, total_phase3, f"[Fase 3 SHA-256] {f_path.name}")
+
+            if res_hash:
+                hash_map.setdefault(res_hash, []).append(f_path)
+            else:
+                summary.unreadable_files_count += 1
 
     # Guardar en lote los nuevos hashes en la caché de SQLite
     if hist_mgr and new_cache_entries:
         try:
             hist_mgr.set_cached_hashes_batch(new_cache_entries)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Aviso guardando lote de hashes en SQLite: {e}")
 
     # Filtrar solo colisiones definitivas
     duplicates: dict[str, list[Path]] = {}
@@ -373,52 +424,28 @@ async def scan_directory_async(
     return duplicates, summary
 
 
-def scan_directory_for_duplicates(
+async def scan_directory_async(
     base_dir: Path,
     max_workers: int | None = None,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     progress_callback: Callable[[int, int, str], None] | None = None,
     warning_callback: Callable[[str], None] | None = None,
     use_cache: bool = True,
-    history_manager: CleaningHistoryManager | None = None
+    history_manager: CleaningHistoryManager | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[dict[str, list[Path]], ScanSummary]:
     """
-    Punto de entrada síncrono compatible con GUI, CLI y pruebas:
-    Ejecuta el pipeline asíncrono sobre el Event Loop de Python sin sobrecarga del GIL.
+    Interfaz asíncrona compatible con AsyncIO:
+    Delega la ejecución al motor de ThreadPoolExecutor nativo liberando el Event Loop.
     """
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-    if loop.is_running():
-        # Si ya se encuentra dentro de un loop en ejecución (ej. entorno embebido),
-        # ejecutamos la corrutina en un hilo auxiliar para no bloquear el loop principal.
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(
-                asyncio.run,
-                scan_directory_async(
-                    base_dir=base_dir,
-                    max_workers=max_workers,
-                    chunk_size=chunk_size,
-                    progress_callback=progress_callback,
-                    warning_callback=warning_callback,
-                    use_cache=use_cache,
-                    history_manager=history_manager
-                )
-            )
-            return future.result()
-    else:
-        return loop.run_until_complete(
-            scan_directory_async(
-                base_dir=base_dir,
-                max_workers=max_workers,
-                chunk_size=chunk_size,
-                progress_callback=progress_callback,
-                warning_callback=warning_callback,
-                use_cache=use_cache,
-                history_manager=history_manager
-            )
-        )
+    return await asyncio.to_thread(
+        scan_directory_for_duplicates,
+        base_dir=base_dir,
+        max_workers=max_workers,
+        chunk_size=chunk_size,
+        progress_callback=progress_callback,
+        warning_callback=warning_callback,
+        use_cache=use_cache,
+        history_manager=history_manager,
+        cancel_event=cancel_event,
+    )

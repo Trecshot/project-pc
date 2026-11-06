@@ -4,5 +4,8 @@ sv-ttk>=2.6.0
 send2trash>=1.8.0
 matplotlib>=3.8.0
 nuitka>=2.0.0
-aiofiles>=24.1.0
+cyclonedx-bom>=4.0.0
+xxhash>=3.0.0
+ruff>=0.1.0
+bandit>=1.7.0
 

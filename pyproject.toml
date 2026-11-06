@@ -12,8 +12,17 @@ dependencies = [
     "rich>=13.0.0",
     "sv-ttk>=2.6.0",
     "send2trash>=1.8.0",
-    "matplotlib>=3.8.0",
-    "aiofiles>=24.1.0"
+    "matplotlib>=3.8.0"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "cyclonedx-bom>=4.0.0",
+    "pip-audit",
+    "xxhash>=3.0.0",
+    "ruff>=0.1.0",
+    "bandit>=1.7.0"
 ]
 
 [project.scripts]
@@ -22,3 +31,14 @@ datacleaner = "datacleaner.cli:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["datacleaner*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]

@@ -21,10 +21,8 @@ from datacleaner.quarantine import (
     quarantine_redundant_files,
     restore_from_quarantine,
     find_quarantine_sessions,
-    purge_quarantine_session,
     purge_all_quarantine_sessions,
-    execute_deletion_plan,
-    DeleteResult
+    execute_deletion_plan
 )
 from datacleaner.reporter import (
     build_audit_plan,
@@ -151,7 +149,7 @@ def cmd_quarantine(args: argparse.Namespace):
             except Exception:
                 pass
 
-        console.print(f"\n[bold green][OK] Eliminación directa finalizada.[/bold green]")
+        console.print("\n[bold green][OK] Eliminación directa finalizada.[/bold green]")
         console.print(f"  * Archivos eliminados: [bold]{del_res.total_deleted}[/bold] ({format_bytes(del_res.total_bytes_deleted)})")
         console.print(f"  * Modo: {'Papelera de Reciclaje (send2trash)' if del_res.used_trash else 'Permanente (unlink)'}")
         if del_res.errors:
@@ -170,12 +168,23 @@ def cmd_quarantine(args: argparse.Namespace):
             console.print("[dim]Operación cancelada por el usuario. No se modificó ningún archivo.[/dim]")
             return
 
-    _execute_quarantine(target_dir, duplicates, args.keep_rule, custom_dir=args.quarantine_dir)
+    _execute_quarantine(target_dir, duplicates, args.keep_rule, custom_dir=args.quarantine_dir, summary=summary)
 
-def _execute_quarantine(base_dir: Path, duplicates: dict, keep_rule: str, custom_dir: str | None = None):
+def _execute_quarantine(
+    base_dir: Path,
+    duplicates: dict,
+    keep_rule: str,
+    custom_dir: str | None = None,
+    summary=None
+):
     """Función auxiliar para trasladar a cuarentena y presentar resultado."""
     custom_p = Path(custom_dir) if custom_dir else None
-    plan = build_audit_plan(duplicates, keep_rule=keep_rule, base_dir=base_dir)
+    plan = build_audit_plan(
+        duplicates,
+        keep_rule=keep_rule,
+        base_dir=base_dir,
+        file_signatures=getattr(summary, "file_signatures", None)
+    )
 
     with console.status("[yellow]Trasladando archivos redundantes a directorio de Cuarentena...[/yellow]"):
         result = quarantine_redundant_files(base_dir, plan, custom_quarantine_dir=custom_p)
@@ -193,11 +202,11 @@ def _execute_quarantine(base_dir: Path, duplicates: dict, keep_rule: str, custom
             pass
 
     console.print()
-    console.print(f"[bold green][OK] Cuarentena completada con exito.[/bold green]")
+    console.print("[bold green][OK] Cuarentena completada con exito.[/bold green]")
     console.print(f"  * Archivos trasladados: [bold]{result.total_moved}[/bold] ({format_bytes(result.total_bytes_moved)})")
     console.print(f"  * Directorio de Cuarentena: [cyan]{result.quarantine_dir}[/cyan]")
     console.print(f"  * Archivo Manifiesto: [yellow]{result.manifest_path}[/yellow]")
-    console.print(f"\n[dim]Para restaurar en cualquier momento, ejecute:[/dim]")
+    console.print("\n[dim]Para restaurar en cualquier momento, ejecute:[/dim]")
     console.print(f"  [bold]datacleaner restore \"{result.manifest_path}\"[/bold]\n")
 
     if result.errors:
@@ -221,7 +230,7 @@ def cmd_restore(args: argparse.Namespace):
             console.print(f"[bold red]Fallo al procesar restauración:[/bold red] {e}")
             sys.exit(1)
 
-    console.print(f"\n[bold green][OK] Restauracion finalizada.[/bold green]")
+    console.print("\n[bold green][OK] Restauracion finalizada.[/bold green]")
     console.print(f"  * Archivos devueltos a su origen: [bold]{res.total_restored}[/bold] ({format_bytes(res.total_bytes_restored)})")
     if res.total_restored > 0:
         try:

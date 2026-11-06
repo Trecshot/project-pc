@@ -9,7 +9,6 @@ de cientos de miles o millones de archivos.
 """
 
 import math
-import hashlib
 from typing import Any
 
 

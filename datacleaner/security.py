@@ -12,6 +12,7 @@ from pathlib import Path
 import os
 import platform
 import tempfile
+import sys
 
 
 def _build_system_blacklist() -> list[Path]:
@@ -90,7 +91,7 @@ def is_root_directory(target_path: Path) -> bool:
     """
     try:
         resolved = target_path.resolve().absolute()
-        
+
         # En Windows, resolved.parent de 'C:\\' es 'C:\\'
         # En Unix, resolved.parent de '/' es '/'
         if resolved.parent == resolved:
@@ -116,7 +117,7 @@ def _is_subpath(child: Path, parent: Path) -> bool:
         parent_res = parent.resolve().absolute()
 
         is_windows = platform.system() == "Windows"
-        
+
         if is_windows:
             child_parts = [p.lower() for p in child_res.parts]
             parent_parts = [p.lower() for p in parent_res.parts]
@@ -158,7 +159,7 @@ def validate_target_path(target_path: str | Path, must_be_dir: bool = True) -> P
 
     # 1. Normalización previa de string para limpiar dobles barras y ./../
     norm_str = os.path.normpath(str(target_path).strip())
-    
+
     # 2. Forzar resolución absoluta estricta
     resolved_target = Path(norm_str).expanduser().resolve().absolute()
 
@@ -170,18 +171,32 @@ def validate_target_path(target_path: str | Path, must_be_dir: bool = True) -> P
         )
 
     # 4. RF-02: Validación contra Lista Negra de Seguridad (Blacklist)
+    # CRIT-05 Hardening: No eximir %TEMP% globalmente en producción.
+    # Permitir únicamente subdirectorios temporales con prefijo explícito de pruebas
+    # (datacleaner_, dc_test_, pytest-) o cuando se ejecute con DATACLEANER_TEST_MODE=1.
     is_temp_child = False
     try:
         sys_temp = Path(tempfile.gettempdir()).resolve().absolute()
         if resolved_target != sys_temp and _is_subpath(resolved_target, sys_temp):
-            is_temp_child = True
+            is_test_env = (
+                os.environ.get("DATACLEANER_TEST_MODE") == "1"
+                or "pytest" in sys.modules
+            )
+            is_explicit_test_prefix = any(
+                p.lower().startswith("datacleaner_")
+                or p.lower().startswith("dc_test_")
+                or p.lower().startswith("pytest-")
+                for p in resolved_target.parts
+            )
+            if is_test_env or is_explicit_test_prefix:
+                is_temp_child = True
     except Exception:
         pass
 
     for restricted in SYSTEM_BLACKLIST:
         restricted_resolved = restricted.resolve().absolute()
 
-        # Omitir comprobaciones para subcarpetas de prueba temporales
+        # Omitir comprobaciones para subcarpetas de prueba temporales validadas
         if is_temp_child and _is_subpath(resolved_target, sys_temp):
             continue
 

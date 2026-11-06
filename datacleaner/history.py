@@ -15,6 +15,10 @@ from dataclasses import dataclass, asdict
 from typing import Any
 import sqlite3
 import json
+import logging
+import hashlib
+
+logger = logging.getLogger(__name__)
 
 
 def _get_default_storage_dir() -> Path:
@@ -97,6 +101,8 @@ class HistoryEntry:
     files_count: int
     bytes_count: int
     details: str = ""
+    prev_hash: str = "GENESIS"
+    entry_hash: str = ""
 
     @property
     def bytes_affected(self) -> int:
@@ -142,6 +148,24 @@ class ManagedConnection(sqlite3.Connection):
             self.close()
 
 
+def _harden_file_permissions(file_path: Path) -> None:
+    """Restringe permisos del archivo a sólo el usuario creador (Principio de Menor Privilegio, NIST SSDF PO.5.1)."""
+    if not file_path.exists():
+        return
+    try:
+        if sys.platform != "win32":
+            os.chmod(file_path, 0o600)
+        else:
+            # Eliminar herencia y restringir acceso exclusivamente al usuario propietario actual (Windows DACL)
+            import subprocess
+            username = os.environ.get("USERNAME")
+            if username:
+                cmd = ["icacls.exe", str(file_path), "/inheritance:r", "/grant:r", f"{username}:(R,W)"]
+                subprocess.run(cmd, capture_output=True, check=False)
+    except (OSError, Exception) as e:
+        logger.debug(f"No se pudieron ajustar permisos para {file_path}: {e}")
+
+
 class CleaningHistoryManager:
     """
     Gestor Transaccional SQLite (`.datacleaner.sqlite`) para el historial de operaciones
@@ -170,6 +194,9 @@ class CleaningHistoryManager:
         conn = sqlite3.connect(str(self.db_path), timeout=10.0, factory=ManagedConnection)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON;")
+
+        # Endurecer permisos del archivo de base de datos
+        _harden_file_permissions(self.db_path)
         return conn
 
     def _init_database(self) -> None:
@@ -193,7 +220,9 @@ class CleaningHistoryManager:
                     target_dir TEXT NOT NULL,
                     files_count INTEGER NOT NULL,
                     bytes_count INTEGER NOT NULL,
-                    details TEXT
+                    details TEXT,
+                    prev_hash TEXT DEFAULT 'GENESIS',
+                    entry_hash TEXT DEFAULT ''
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_operations_timestamp
@@ -242,7 +271,21 @@ class CleaningHistoryManager:
                     ON file_hash_cache(file_path, mtime);
                 """
             )
+
+            # Migración: agregar columnas de encadenamiento criptográfico si la BD fue creada previamente
+            cur_ops = conn.execute("PRAGMA table_info(operations_history)")
+            ops_cols = {row["name"] for row in cur_ops.fetchall()}
+            if "prev_hash" not in ops_cols:
+                conn.execute("ALTER TABLE operations_history ADD COLUMN prev_hash TEXT DEFAULT 'GENESIS';")
+            if "entry_hash" not in ops_cols:
+                conn.execute("ALTER TABLE operations_history ADD COLUMN entry_hash TEXT DEFAULT '';")
+
             conn.commit()
+        # Mantenimiento preventivo: podar registros obsoletos (> 60 días)
+        try:
+            self.cleanup_obsolete_cache(days=60)
+        except Exception as e:
+            logger.debug(f"Aviso durante poda de caché en inicio: {e}")
 
     def _migrate_legacy_json_if_needed(self) -> None:
         """Migra entradas previas de `.datacleaner_history.json` si existiera."""
@@ -279,13 +322,56 @@ class CleaningHistoryManager:
         except Exception:
             pass
 
+    def cleanup_obsolete_cache(self, days: int = 60) -> int:
+        """
+        Poda registros de caché y sesiones temporales antiguas para prevenir
+        el crecimiento indefinido de la base de datos (MED-03).
+        """
+        try:
+            with self._get_connection() as conn:
+                cur = conn.execute(
+                    "DELETE FROM file_hash_cache WHERE updated_at < datetime('now', ?)",
+                    (f"-{days} days",)
+                )
+                purged_cache = cur.rowcount
+                conn.execute(
+                    "DELETE FROM sesiones_cuarentena WHERE status = 'DRY_RUN_COMPLETED' AND timestamp < datetime('now', '-30 days')"
+                )
+                conn.commit()
+                return purged_cache
+        except Exception as e:
+            logger.warning(f"Error en limpieza de registros obsoletos de base de datos: {e}")
+            return 0
+
+    def invalidate_cache_entries(self, file_paths: list[Path | str]) -> int:
+        """
+        Invalida/elimina de file_hash_cache las rutas que hayan sido borradas o movidas (MED-03).
+        """
+        if not file_paths:
+            return 0
+        deleted_count = 0
+        try:
+            with self._get_connection() as conn:
+                del_sql = (
+                    "DELETE FROM file_hash_cache WHERE file_path = ? COLLATE NOCASE"
+                    if sys.platform == "win32"
+                    else "DELETE FROM file_hash_cache WHERE file_path = ?"
+                )
+                for p in file_paths:
+                    p_str = str(Path(p).resolve())
+                    cur = conn.execute(del_sql, (p_str,))
+                    deleted_count += cur.rowcount
+                conn.commit()
+        except Exception as e:
+            logger.warning(f"Error invalidando entradas en file_hash_cache: {e}")
+        return deleted_count
+
     def load_cache_for_directory(self, base_dir: Path | str) -> dict[str, Any]:
         """
         Carga en memoria todos los registros de caché correspondientes al directorio base
         en una sola consulta SQL agrupada, permitiendo búsquedas O(1) en memoria sin
-        abrir conexiones SQLite repetidas durante el bucle asíncrono.
-        Utiliza comparación exacta por prefijo con substr para evitar el comportamiento
-        de comodines % y _ de LIKE, previniendo falsas colisiones entre carpetas con prefijo común.
+        abrir conexiones SQLite repetidas durante el escaneo.
+        Incorpora COLLATE NOCASE en Windows para evitar pérdidas de cache hits por case-sensitivity (CRIT-04).
         """
         resolved_dir = str(Path(base_dir).resolve())
         prefix = resolved_dir if resolved_dir.endswith(os.sep) else resolved_dir + os.sep
@@ -294,14 +380,20 @@ class CleaningHistoryManager:
 
         try:
             with self._get_connection() as conn:
-                rows = conn.execute(
+                select_sql = (
                     """
                     SELECT file_path, device_id, inode, file_size, mtime, partial_hash, sha256_hash
                     FROM file_hash_cache
+                    WHERE substr(file_path, 1, ?) = ? COLLATE NOCASE
+                    """
+                    if sys.platform == "win32"
+                    else """
+                    SELECT file_path, device_id, inode, file_size, mtime, partial_hash, sha256_hash
+                    FROM file_hash_cache
                     WHERE substr(file_path, 1, ?) = ?
-                    """,
-                    (len(prefix), prefix)
-                ).fetchall()
+                    """
+                )
+                rows = conn.execute(select_sql, (len(prefix), prefix)).fetchall()
 
                 for r in rows:
                     entry = {
@@ -313,13 +405,16 @@ class CleaningHistoryManager:
                         "partial_hash": r["partial_hash"],
                         "sha256_hash": r["sha256_hash"],
                     }
-                    by_path[r["file_path"]] = entry
+                    orig_p = r["file_path"]
+                    by_path[orig_p] = entry
+                    norm_p = os.path.normcase(orig_p)
+                    by_path[norm_p] = entry
                     dev = str(r["device_id"] or "")
                     ino = str(r["inode"] or "")
                     if ino and ino != "0":
                         by_inode[(dev, ino)] = entry
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Error al cargar caché de directorio para '{base_dir}': {e}")
 
         return {"by_path": by_path, "by_inode": by_inode}
 
@@ -354,16 +449,23 @@ class CleaningHistoryManager:
                 if row and abs(float(row["mtime"]) - float(mtime)) < 1e-4 and int(row["file_size"]) == file_size:
                     return row["partial_hash"], row["sha256_hash"]
 
-            # 2. Búsqueda alternativa por ruta canónica y mtime
-            row = conn.execute(
+            # 2. Búsqueda alternativa por ruta canónica y mtime (con COLLATE NOCASE en Windows)
+            query_path_sql = (
                 """
+                SELECT partial_hash, sha256_hash, file_size, mtime
+                FROM file_hash_cache
+                WHERE file_path = ? COLLATE NOCASE
+                LIMIT 1
+                """
+                if sys.platform == "win32"
+                else """
                 SELECT partial_hash, sha256_hash, file_size, mtime
                 FROM file_hash_cache
                 WHERE file_path = ?
                 LIMIT 1
-                """,
-                (p_str,),
-            ).fetchone()
+                """
+            )
+            row = conn.execute(query_path_sql, (p_str,)).fetchone()
             if row and abs(float(row["mtime"]) - float(mtime)) < 1e-4 and int(row["file_size"]) == file_size:
                 return row["partial_hash"], row["sha256_hash"]
 
@@ -528,6 +630,10 @@ class CleaningHistoryManager:
             next_id = row["next_id"] if row else 1
             entry_id = f"hist_{now.strftime('%Y%m%d_%H%M%S_%f')}_{next_id}"
 
+            # Obtener hash de la fila previa para encadenamiento criptográfico (NIST SSDF PO.4)
+            last_row = conn.execute("SELECT entry_hash FROM operations_history ORDER BY rowid DESC LIMIT 1").fetchone()
+            prev_hash = last_row["entry_hash"] if last_row and last_row["entry_hash"] else "GENESIS"
+
             new_entry = HistoryEntry(
                 entry_id=entry_id,
                 timestamp=now.strftime("%Y-%m-%d %H:%M:%S"),
@@ -537,13 +643,22 @@ class CleaningHistoryManager:
                 files_count=max(0, int(files_count)),
                 bytes_count=max(0, int(actual_bytes)),
                 details=details,
+                prev_hash=prev_hash,
             )
+
+            # Cálculo de entry_hash vinculando prev_hash con todos los datos inmutables de la fila
+            chain_payload = (
+                f"{prev_hash}|{new_entry.entry_id}|{new_entry.timestamp}|{new_entry.action_type}|"
+                f"{new_entry.target_dir}|{new_entry.files_count}|{new_entry.bytes_count}"
+            )
+            entry_hash = hashlib.sha256(chain_payload.encode("utf-8")).hexdigest()
+            new_entry.entry_hash = entry_hash
 
             conn.execute(
                 """
                 INSERT INTO operations_history
-                (entry_id, timestamp, action_type, action_label, target_dir, files_count, bytes_count, details)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (entry_id, timestamp, action_type, action_label, target_dir, files_count, bytes_count, details, prev_hash, entry_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     new_entry.entry_id,
@@ -554,11 +669,62 @@ class CleaningHistoryManager:
                     new_entry.files_count,
                     new_entry.bytes_count,
                     new_entry.details,
+                    prev_hash,
+                    entry_hash,
                 )
             )
             conn.commit()
 
         return new_entry
+
+    def verify_audit_chain_integrity(self) -> tuple[bool, list[str]]:
+        """
+        Verifica la inmutabilidad y la cadena criptográfica (hash-chain / tamper-evident)
+        de operations_history. Detecta alteraciones, borrados o inserciones manuales (NIST SSDF PO.4).
+        Retorna (is_valid, errors).
+        """
+        errors = []
+        with self._get_connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT rowid, entry_id, timestamp, action_type, target_dir, files_count, bytes_count, prev_hash, entry_hash
+                FROM operations_history
+                ORDER BY rowid ASC
+                """
+            ).fetchall()
+
+            expected_prev = "GENESIS"
+            for r in rows:
+                p_hash = r["prev_hash"] or "GENESIS"
+                e_hash = r["entry_hash"] or ""
+
+                # Omitir filas legacy sin hash
+                if not e_hash:
+                    continue
+
+                if p_hash != expected_prev:
+                    errors.append(
+                        f"[CADENA ROTA] Fila rowid={r['rowid']} ({r['entry_id']}): "
+                        f"prev_hash '{p_hash}' no coincide con el hash previo esperado '{expected_prev}'."
+                    )
+
+                chain_payload = (
+                    f"{p_hash}|{r['entry_id']}|{r['timestamp']}|{r['action_type']}|"
+                    f"{r['target_dir']}|{r['files_count']}|{r['bytes_count']}"
+                )
+                computed_hash = hashlib.sha256(chain_payload.encode("utf-8")).hexdigest()
+                if computed_hash != e_hash:
+                    errors.append(
+                        f"[ADULTERACIÓN DETECTADA] Fila rowid={r['rowid']} ({r['entry_id']}): "
+                        f"los datos fueron modificados. Hash almacenado={e_hash}, hash calculado={computed_hash}."
+                    )
+
+                expected_prev = e_hash
+
+        return (len(errors) == 0, errors)
+
+    # Alias de compatibilidad (NIST SSDF PO.4)
+    record_operation = record_event
 
     def get_summary(self) -> HistorySummary:
         """
@@ -568,11 +734,11 @@ class CleaningHistoryManager:
         with self._get_connection() as conn:
             agg = conn.execute(
                 """
-                SELECT 
+                SELECT
                     COUNT(*) as total_ops,
                     COALESCE(SUM(CASE WHEN action_type IN ('QUARANTINE', 'HARDLINK', 'TRASH', 'PERMANENT') THEN files_count ELSE 0 END), 0) -
                     COALESCE(SUM(CASE WHEN action_type = 'RESTORE' THEN files_count ELSE 0 END), 0) as net_files,
-                    COALESCE(SUM(CASE WHEN action_type IN ('QUARANTINE', 'HARDLINK', 'TRASH', 'PERMANENT') THEN bytes_count ELSE 0 END), 0) - 
+                    COALESCE(SUM(CASE WHEN action_type IN ('QUARANTINE', 'HARDLINK', 'TRASH', 'PERMANENT') THEN bytes_count ELSE 0 END), 0) -
                     COALESCE(SUM(CASE WHEN action_type = 'RESTORE' THEN bytes_count ELSE 0 END), 0) as net_bytes,
                     COALESCE(SUM(CASE WHEN action_type IN ('PERMANENT', 'PURGE') THEN bytes_count ELSE 0 END), 0) as purged_bytes
                 FROM operations_history;

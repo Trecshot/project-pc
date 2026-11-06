@@ -1,0 +1,41 @@
+name: Security & Quality Gate
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  audit-and-test:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4.1.1
+
+      - name: Configurar Python
+        uses: actions/setup-python@0a5c61591373683505ea898e09a6ea8db8ce1b6a  # v5.0.0
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pip-audit cyclonedx-bom
+
+      - name: Análisis de Composición de Software (SCA / CVE Scanner)
+        run: |
+          pip-audit
+
+      - name: Análisis de Seguridad Estático (SAST - Bandit)
+        run: |
+          bandit -r datacleaner/ -ll
+
+      - name: Linter y Formato Estricto (Ruff)
+        run: |
+          ruff check datacleaner/
+
+      - name: Ejecutar Suite de Tests y Hardening
+        run: |
+          pytest tests/ -v

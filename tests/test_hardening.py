@@ -155,7 +155,7 @@ class TestHardeningAndSecurity(unittest.TestCase):
             q_mod.HAS_SEND2TRASH = orig_has
 
     def test_scanner_phase2_real_partial_hash_saved_in_sqlite(self):
-        """Hardening scanner.py: partial_hash guardado en SQLite debe ser el MD5 real (32 hex), no 'md5_edges'."""
+        """Hardening scanner.py: partial_hash guardado en SQLite debe ser un hash seguro de 32 hex (SHA-256 truncado), no 'md5_edges'."""
         from datacleaner.history import CleaningHistoryManager
         db_path = self.base_path / "cache_integrity_test.sqlite"
         mgr = CleaningHistoryManager(storage_path=db_path)
@@ -178,7 +178,7 @@ class TestHardeningAndSecurity(unittest.TestCase):
                 p_hash = r["partial_hash"]
                 self.assertIsNotNone(p_hash)
                 self.assertNotEqual(p_hash, "md5_edges", "El partial_hash no debe ser un placeholder 'md5_edges'")
-                self.assertEqual(len(p_hash), 32, "El partial_hash debe ser un hash MD5 hexadecimal válido")
+                self.assertEqual(len(p_hash), 32, "El partial_hash debe ser un hash hexadecimal seguro de 32 caracteres (NIST SP 800-131A / FIPS 140-3)")
 
     def test_rules_cleanliness_no_false_positive_substrings(self):
         """Hardening rules.py: Nombres como Templates o Copyright no deben ser penalizados por contener 'temp' o 'copy'."""

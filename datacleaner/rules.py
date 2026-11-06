@@ -9,7 +9,6 @@ de ruta y fecha de modificación. Cumple con la Sección 7 de la especificación
 
 from pathlib import Path
 from enum import Enum
-import os
 import re
 
 class KeepRule(str, Enum):
@@ -46,6 +45,8 @@ def calculate_path_cleanliness_score(path: Path, base_dir: Path | None = None) -
 
     # Penalizar si contiene componentes o tokens provisionales
     for part in parts_to_evaluate:
+        if "\u202e" in part:
+            score -= 10000
         tokens = set(re.split(r'[\s_\-\.]+', part.lower()))
         if any(keyword in tokens for keyword in SUSPICIOUS_PATH_KEYWORDS):
             score -= 100
@@ -92,7 +93,14 @@ def select_file_to_keep(
     def sort_key(p: Path):
         mtime = get_file_mtime(p)
         clean_score = calculate_path_cleanliness_score(p, base_dir=base_dir)
-        depth = len(p.parts)
+        if base_dir:
+            try:
+                rel_parts = p.resolve().relative_to(base_dir.resolve()).parts
+                depth = len(rel_parts)
+            except ValueError:
+                depth = len(p.parts)
+        else:
+            depth = len(p.parts)
 
         if rule == KeepRule.DEEPEST_THEN_NEWEST:
             # Mayor puntaje de limpieza primero, luego mayor mtime, luego orden alfabético
@@ -101,8 +109,8 @@ def select_file_to_keep(
             # Mayor puntaje de limpieza primero, luego menor mtime
             return (clean_score, -mtime, -len(str(p)), str(p))
         elif rule == KeepRule.SHALLOWEST_THEN_NEWEST:
-            # Menor profundidad, mayor mtime
-            return (-depth, mtime, str(p))
+            # Menor profundidad relativa, mayor clean_score como desempate, mayor mtime
+            return (-depth, clean_score, mtime, str(p))
         elif rule == KeepRule.NEWEST_ONLY:
             return (mtime, clean_score, str(p))
         elif rule == KeepRule.OLDEST_ONLY:

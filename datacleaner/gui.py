@@ -51,7 +51,6 @@ from datacleaner.quarantine import (
     find_quarantine_sessions,
     purge_quarantine_session,
     purge_all_quarantine_sessions,
-    delete_redundant_files,
     execute_deletion_plan,
     deduplicate_with_hardlinks,
     QuarantineResult,
@@ -360,27 +359,40 @@ class RestoreModal(tk.Toplevel):
         if not confirm:
             return
 
-        try:
-            purge_quarantine_session(s["folder_path"])
-            self.history_manager.record_event(
-                action_type="PURGE",
-                target_dir=self.base_dir,
-                files_count=s["total_files"],
-                bytes_count=s["total_bytes"]
-            )
-            messagebox.showinfo(
-                "Cuarentena Purgada",
-                f"La sesión '{s['session_id']}' fue eliminada permanentemente.",
-                parent=self
-            )
-            self._load_sessions()
-            if self.on_restore_success:
-                self.on_restore_success()
-        except Exception as e:
-            messagebox.showerror("Error al Purgar", f"No se pudo purgar la sesión: {e}", parent=self)
+        self.restore_btn.configure(state="disabled")
+        self.purge_btn.configure(state="disabled")
+        self.summary_lbl.configure(text=f"⏳ Purgando sesión '{s['session_id']}' en segundo plano...")
+
+        def _bg_purge():
+            try:
+                purge_quarantine_session(s["folder_path"])
+                self.history_manager.record_event(
+                    action_type="PURGE",
+                    target_dir=self.base_dir,
+                    files_count=s["total_files"],
+                    bytes_count=s["total_bytes"]
+                )
+                def on_done():
+                    messagebox.showinfo(
+                        "Cuarentena Purgada",
+                        f"La sesión '{s['session_id']}' fue eliminada permanentemente.",
+                        parent=self
+                    )
+                    self._load_sessions()
+                    if self.on_restore_success:
+                        self.on_restore_success()
+                self.after(0, on_done)
+            except Exception as exc:
+                err_msg = str(exc)
+                def on_err():
+                    messagebox.showerror("Error al Purgar", f"No se pudo purgar la sesión: {err_msg}", parent=self)
+                    self._load_sessions()
+                self.after(0, on_err)
+
+        threading.Thread(target=_bg_purge, daemon=True).start()
 
     def _execute_purge_all(self):
-        """Opción 1: Purgar todas las sesiones de cuarentena del directorio actual."""
+        """Opción 1: Purgar todas las sesiones de cuarentena del directorio actual (en segundo plano)."""
         if not self.sessions:
             return
 
@@ -397,25 +409,39 @@ class RestoreModal(tk.Toplevel):
         if not confirm:
             return
 
-        try:
-            purged = purge_all_quarantine_sessions(self.base_dir)
-            if purged > 0:
-                self.history_manager.record_event(
-                    action_type="PURGE",
-                    target_dir=self.base_dir,
-                    files_count=total_f,
-                    bytes_count=total_b
-                )
-            messagebox.showinfo(
-                "Vaciado Completo",
-                f"Se purgaron {purged} sesiones de cuarentena satisfactoriamente.",
-                parent=self
-            )
-            self._load_sessions()
-            if self.on_restore_success:
-                self.on_restore_success()
-        except Exception as e:
-            messagebox.showerror("Error al Purgar", f"Ocurrió un error purgando sesiones: {e}", parent=self)
+        self.restore_btn.configure(state="disabled")
+        self.purge_btn.configure(state="disabled")
+        self.purge_all_btn.configure(state="disabled")
+        self.summary_lbl.configure(text="⏳ Purgando todas las sesiones de cuarentena en segundo plano...")
+
+        def _bg_purge_all():
+            try:
+                purged = purge_all_quarantine_sessions(self.base_dir)
+                if purged > 0:
+                    self.history_manager.record_event(
+                        action_type="PURGE",
+                        target_dir=self.base_dir,
+                        files_count=total_f,
+                        bytes_count=total_b
+                    )
+                def on_done():
+                    messagebox.showinfo(
+                        "Vaciado Completo",
+                        f"Se purgaron {purged} sesiones de cuarentena satisfactoriamente.",
+                        parent=self
+                    )
+                    self._load_sessions()
+                    if self.on_restore_success:
+                        self.on_restore_success()
+                self.after(0, on_done)
+            except Exception as exc:
+                err_msg = str(exc)
+                def on_err():
+                    messagebox.showerror("Error al Purgar", f"Ocurrió un error purgando sesiones: {err_msg}", parent=self)
+                    self._load_sessions()
+                self.after(0, on_err)
+
+        threading.Thread(target=_bg_purge_all, daemon=True).start()
 
     def _change_search_dir(self):
         chosen = filedialog.askdirectory(title="Seleccionar directorio donde buscar cuarentenas", parent=self)
@@ -461,8 +487,9 @@ class RestoreModal(tk.Toplevel):
             try:
                 res = restore_from_quarantine(manifest_path)
                 self.after(0, lambda: self._on_restore_done(res))
-            except Exception as e:
-                self.after(0, lambda: self._on_restore_error(e))
+            except Exception as exc:
+                err_msg = str(exc)
+                self.after(0, lambda: self._on_restore_error(err_msg))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -520,6 +547,7 @@ class DataCleanerGUI:
         self.validation_state = "idle"  # "idle", "valid", "warning", "error"
         self.history_manager = CleaningHistoryManager()
         self.unit_preference = "AUTO"  # "AUTO", "GB", "MB", "KB"
+        self.scan_cancel_event: threading.Event | None = None
 
         # 1. Inyección de Tema Sun Valley (Fluent Design Windows 11)
         self._apply_sun_valley_theme()
@@ -956,6 +984,14 @@ class DataCleanerGUI:
             state="disabled"
         )
         self.scan_btn.pack(side="left", padx=(0, 8))
+
+        self.cancel_scan_btn = ttk.Button(
+            action_bar,
+            text="⏹ Cancelar",
+            command=self._cancel_scan,
+            state="disabled"
+        )
+        self.cancel_scan_btn.pack(side="left", padx=(0, 8))
 
         self.quarantine_btn = ttk.Button(
             action_bar,
@@ -1835,6 +1871,14 @@ class DataCleanerGUI:
         self.log_text.insert(tk.END, f"{text}\n")
         self.log_text.see(tk.END)
 
+    def _cancel_scan(self):
+        """Cancela cooperativamente el escaneo en segundo plano (MED-01)."""
+        if self.scan_cancel_event:
+            self.scan_cancel_event.set()
+            self.cancel_scan_btn.configure(state="disabled")
+            self.status_label.configure(text="⏳ Cancelando auditoría...")
+            self._log("⏳ Solicitud de cancelación enviada al motor de escaneo...")
+
     def _start_scan_thread(self):
         if self.is_processing or not self.current_base_dir:
             return
@@ -1845,7 +1889,9 @@ class DataCleanerGUI:
         workers = get_safe_worker_count()
 
         self.is_processing = True
+        self.scan_cancel_event = threading.Event()
         self.scan_btn.configure(state="disabled")
+        self.cancel_scan_btn.configure(state="normal")
         self.quarantine_btn.configure(state="disabled", style="TButton")
         self.export_btn.configure(state="disabled")
         self.progress_bar["value"] = 0
@@ -1867,7 +1913,8 @@ class DataCleanerGUI:
             duplicates, summary = scan_directory_for_duplicates(
                 base_dir=target_dir,
                 max_workers=workers,
-                progress_callback=progress_cb
+                progress_callback=progress_cb,
+                cancel_event=self.scan_cancel_event
             )
 
             report = generate_report_dict(
@@ -1888,7 +1935,16 @@ class DataCleanerGUI:
 
     def _on_scan_completed(self, duplicates: dict, summary: ScanSummary, report: dict):
         self.is_processing = False
+        self.cancel_scan_btn.configure(state="disabled")
         self.scan_btn.configure(state="normal", style="Accent.TButton")
+
+        if getattr(summary, "cancelled", False):
+            self.progress_bar["value"] = 0
+            self.percent_label.configure(text="0%")
+            self.status_label.configure(text="⏹ Auditoría cancelada por el usuario.")
+            self._log("⏹ Auditoría cancelada.")
+            return
+
         self.progress_bar["value"] = 100
         self.percent_label.configure(text="100%")
         self.last_duplicates = duplicates
@@ -2056,7 +2112,12 @@ class DataCleanerGUI:
         rec_str = self.last_report["metadata"]["recoverable_formatted"]
         rule_key = self.rule_combobox.get()
         keep_rule = RULE_OPTIONS.get(rule_key, KeepRule.DEEPEST_THEN_NEWEST.value)
-        plan = build_audit_plan(self.last_duplicates, keep_rule=keep_rule, base_dir=self.current_base_dir)
+        plan = build_audit_plan(
+            self.last_duplicates,
+            keep_rule=keep_rule,
+            base_dir=self.current_base_dir,
+            file_signatures=getattr(self.last_summary, "file_signatures", None)
+        )
 
         # 1. Determinar modo de mitigación y solicitar confirmación en el Main Thread
         op_mode = None
@@ -2220,10 +2281,11 @@ class DataCleanerGUI:
                         self._start_scan_thread()
                     self.root.after(0, on_quar_done)
 
-            except Exception as e:
+            except Exception as exc:
+                err_msg = str(exc)
                 def on_err():
                     self._finish_mitigation()
-                    messagebox.showerror(f"Error en {op_mode}", f"Ocurrió un error al procesar los archivos: {e}")
+                    messagebox.showerror(f"Error en {op_mode}", f"Ocurrió un error al procesar los archivos: {err_msg}")
                 self.root.after(0, on_err)
 
         threading.Thread(target=_bg_worker, daemon=True).start()
@@ -2278,7 +2340,7 @@ class DataCleanerGUI:
 
 def launch_gui(initial_dir: str | None = None):
     root = tk.Tk()
-    app = DataCleanerGUI(root, initial_dir=initial_dir)
+    _app = DataCleanerGUI(root, initial_dir=initial_dir)
     root.mainloop()
 
 

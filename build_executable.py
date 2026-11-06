@@ -88,10 +88,71 @@ def get_nuitka_command(python_exe: str = sys.executable, root_dir: Path | None =
     return cmd
 
 
+def generate_sbom(root_dir: Path) -> Path:
+    """Genera un archivo SBOM normalizado CycloneDX JSON (NIST SSDF PS.3.2 / CNCF)."""
+    dist_dir = root_dir / "dist"
+    dist_dir.mkdir(parents=True, exist_ok=True)
+    sbom_path = dist_dir / "datacleaner_sbom.json"
+
+    print("[SBOM] Generando Software Bill of Materials (CycloneDX)...")
+    try:
+        subprocess.run(
+            [
+                sys.executable, "-m", "cyclonedx_py",
+                "pip",
+                "--output-file", str(sbom_path),
+                "--output-format", "JSON"
+            ],
+            cwd=str(root_dir),
+            check=True
+        )
+        print(f"[SBOM] Generado exitosamente en: {sbom_path}")
+        return sbom_path
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        print(f"[SBOM][ADVERTENCIA] No se pudo generar automáticamente el SBOM: {e}")
+        return sbom_path
+
+
+def sign_artifact(binary_path: Path) -> bool:
+    """
+    Aplica firma digital Authenticode (NIST SSDF PS.1.1 / CNCF Artifact Trust).
+    Usa el certificado empresarial configurado en el entorno de compilación.
+    """
+    if sys.platform != "win32" or not binary_path.exists():
+        return False
+
+    cert_thumbprint = os.environ.get("CODESIGN_THUMBPRINT")
+    timestamp_server = os.environ.get("CODESIGN_TS_URL", "http://timestamp.digicert.com")
+
+    if not cert_thumbprint:
+        print("[CODE-SIGN][AVISO] CODESIGN_THUMBPRINT no está configurado. El binario no fue firmado.")
+        return False
+
+    print(f"[CODE-SIGN] Firmando digitalmente {binary_path.name}...")
+    cmd = [
+        "signtool.exe", "sign",
+        "/sha1", cert_thumbprint,
+        "/tr", timestamp_server,
+        "/td", "SHA256",
+        "/fd", "SHA256",
+        str(binary_path)
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode == 0:
+        print("[CODE-SIGN] Binario firmado satisfactoriamente.")
+        return True
+    else:
+        print(f"[CODE-SIGN][ERROR] Error de firma: {res.stderr}")
+        return False
+
+
 def build() -> int:
     root_dir = Path(__file__).resolve().parent
     assets_dir = root_dir / "datacleaner" / "assets"
     assets_dir.mkdir(parents=True, exist_ok=True)
+
+    # Generar SBOM previo al empaquetado final (NIST SSDF PS.3.2)
+    generate_sbom(root_dir)
 
     cmd = get_nuitka_command()
     print("=" * 72)
@@ -101,6 +162,17 @@ def build() -> int:
 
     try:
         res = subprocess.run(cmd, cwd=str(root_dir), check=False)
+        if res.returncode == 0:
+            # Ubicar el binario compilado y aplicar firma Authenticode (NIST SSDF PS.1.1)
+            binary_candidates = [
+                root_dir / "main.exe",
+                root_dir / "DataCleaner.exe",
+                root_dir / "dist" / "main.exe",
+            ]
+            for candidate in binary_candidates:
+                if candidate.exists():
+                    sign_artifact(candidate)
+                    break
         return res.returncode
     except FileNotFoundError as exc:
         print(f"Error al invocar Nuitka: {exc}")

@@ -7,54 +7,66 @@ Cumple con RF-05 y el Principio de Simulación Obligatoria (1.2).
 """
 
 from pathlib import Path
-from dataclasses import dataclass
 from typing import Any
 import json
-import math
+import os
 
-from datacleaner.rules import select_file_to_keep, KeepRule
+from datacleaner.rules import select_file_to_keep
 from datacleaner.scanner import ScanSummary
 from datacleaner.magic import analyze_file_signature
-
-def format_bytes(bytes_count: int) -> str:
-    """Convierte bytes a formato legible (B, KB, MB, GB, TB) escalando automáticamente."""
-    if bytes_count <= 0:
-        return "0 B"
-    units = ["B", "KB", "MB", "GB", "TB", "PB"]
-    val = float(bytes_count)
-    idx = 0
-    while val >= 1000.0 and idx < len(units) - 1:
-        val /= 1024.0
-        idx += 1
-    if idx == 0:
-        return f"{int(val)} B"
-    return f"{round(val, 2)} {units[idx]}"
+from datacleaner.history import format_bytes_auto as format_bytes
 
 def build_audit_plan(
     duplicates: dict[str, list[Path]],
     keep_rule: str = "deepest_then_newest",
-    base_dir: Path | None = None
+    base_dir: Path | None = None,
+    file_signatures: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """
     Construye el plan de auditoría determinando para cada hash qué archivo se conserva
-    y cuáles se asignan a cuarentena.
+    y cuáles se asignan a cuarentena o mitigación.
+    Registra snapshots exactos de (size, mtime) para blindaje anti-TOCTOU (CRIT-01)
+    y reutiliza firmas binarias evaluadas en escaneo para evitar doble I/O (MED-01).
     """
     plan = []
     for sha, paths in duplicates.items():
         kept_file, quarantine_files = select_file_to_keep(paths, rule=keep_rule, base_dir=base_dir)
         try:
-            size = paths[0].stat().st_size
-        except (OSError, IndexError):
-            size = 0
+            kept_stat = kept_file.stat()
+            size = kept_stat.st_size
+            kept_mtime = kept_stat.st_mtime
+        except OSError:
+            try:
+                size = paths[0].stat().st_size
+                kept_mtime = paths[0].stat().st_mtime
+            except (OSError, IndexError):
+                size = 0
+                kept_mtime = 0.0
 
-        sig = analyze_file_signature(kept_file)
+        # Snapshot de (size, mtime) por cada archivo redundante para verificación TOCTOU
+        quarantine_snapshots = {}
+        for q_p in quarantine_files:
+            try:
+                st = q_p.stat()
+                res_p = str(q_p.resolve())
+                quarantine_snapshots[res_p] = (st.st_size, st.st_mtime)
+                quarantine_snapshots[os.path.normcase(res_p)] = (st.st_size, st.st_mtime)
+                quarantine_snapshots[str(q_p)] = (st.st_size, st.st_mtime)
+            except OSError:
+                pass
+
+        resolved_kept = str(kept_file.resolve())
+        sig = (file_signatures or {}).get(resolved_kept) or analyze_file_signature(kept_file)
 
         plan.append({
             "hash": sha,
             "size_per_file": size,
+            "expected_size": size,
+            "keep_mtime": kept_mtime,
             "size_formatted": format_bytes(size),
             "keep": kept_file,
             "quarantine": quarantine_files,
+            "quarantine_snapshots": quarantine_snapshots,
             "recoverable_bytes": size * len(quarantine_files),
             "recoverable_formatted": format_bytes(size * len(quarantine_files)),
             "total_group_files": len(paths),
@@ -74,7 +86,12 @@ def generate_report_dict(
     keep_rule: str = "deepest_then_newest"
 ) -> dict[str, Any]:
     """Genera la estructura de diccionario completa para reporte / exportación JSON."""
-    plan = build_audit_plan(duplicates, keep_rule=keep_rule, base_dir=base_dir)
+    plan = build_audit_plan(
+        duplicates,
+        keep_rule=keep_rule,
+        base_dir=base_dir,
+        file_signatures=getattr(summary, "file_signatures", None)
+    )
 
     total_quarantine_files = sum(len(item["quarantine"]) for item in plan)
     total_recoverable_bytes = sum(item["recoverable_bytes"] for item in plan)

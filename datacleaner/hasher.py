@@ -18,7 +18,13 @@ from pathlib import Path
 from typing import Callable
 
 try:
-    import aiofiles
+    import xxhash
+    HAS_XXHASH = True
+except ImportError:
+    HAS_XXHASH = False
+
+try:
+    import aiofiles  # noqa: F401
     HAS_AIOFILES = True
 except ImportError:
     HAS_AIOFILES = False
@@ -47,20 +53,31 @@ def compute_partial_hash(
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     on_error: Callable[[str], None] | None = None
 ) -> str | None:
-    """Calcula un hash preliminar rápido leyendo solo los extremos del archivo."""
-    fast_hash = hashlib.md5()  # MD5 es más veloz y suficiente para descarte preliminar
+    """
+    Calcula un hash preliminar ultra-rápido de los extremos (primer y último chunk).
+    Utiliza XXH3 (xxHash 128-bit) para streaming a máxima velocidad saturando el bus PCIe/NVMe
+    sin sobrecarga criptográfica pesada. Incorpora fallback automático a BLAKE2b/SHA-256 (32 hex).
+    """
+    if HAS_XXHASH:
+        fast_hasher = xxhash.xxh3_128()
+    elif hasattr(hashlib, "blake2b"):
+        fast_hasher = hashlib.blake2b(digest_size=16)
+    else:
+        fast_hasher = hashlib.sha256()
+
     try:
         file_size = file_path.stat().st_size
         with open(file_path, "rb") as f:
             # 1. Leer cabecera (Magic Numbers y primeros metadatos)
-            fast_hash.update(f.read(chunk_size))
+            fast_hasher.update(f.read(chunk_size))
 
             # 2. Leer cola (Firmas de cierre y EOF)
             if file_size > chunk_size * 2:
                 f.seek(-chunk_size, os.SEEK_END)
-                fast_hash.update(f.read(chunk_size))
+                fast_hasher.update(f.read(chunk_size))
 
-        return fast_hash.hexdigest()
+        # Se toma el prefijo hexadecimal (32 caracteres / 128 bits) como fast-hash seguro
+        return fast_hasher.hexdigest()[:32]
     except (PermissionError, OSError, FileNotFoundError, IOError) as exc:
         if on_error:
             on_error(f"Error en lectura parcial de '{file_path}': {exc}")
@@ -107,27 +124,10 @@ async def compute_partial_hash_async(
     on_error: Callable[[str], None] | None = None
 ) -> str | None:
     """
-    Fase 2 Asíncrona (AsyncIO + aiofiles):
-    Calcula el hash preliminar rápido leyendo solo los extremos del archivo sin bloquear el Event Loop.
+    Fase 2 Asíncrona:
+    Calcula el hash preliminar rápido en un hilo de trabajo nativo liberando el GIL en C.
     """
-    fast_hash = hashlib.md5()
-    try:
-        file_size = file_path.stat().st_size
-        if HAS_AIOFILES:
-            async with aiofiles.open(file_path, "rb") as f:
-                first_chunk = await f.read(chunk_size)
-                fast_hash.update(first_chunk)
-                if file_size > chunk_size * 2:
-                    await f.seek(-chunk_size, os.SEEK_END)
-                    last_chunk = await f.read(chunk_size)
-                    fast_hash.update(last_chunk)
-            return fast_hash.hexdigest()
-        else:
-            return await asyncio.to_thread(compute_partial_hash, file_path, chunk_size, on_error)
-    except (PermissionError, OSError, FileNotFoundError, IOError) as exc:
-        if on_error:
-            on_error(f"Error en lectura parcial async de '{file_path}': {exc}")
-        return None
+    return await asyncio.to_thread(compute_partial_hash, file_path, chunk_size, on_error)
 
 
 async def compute_file_hash_async(
@@ -136,20 +136,7 @@ async def compute_file_hash_async(
     on_error: Callable[[str], None] | None = None
 ) -> str | None:
     """
-    Fase 3 Asíncrona (AsyncIO + aiofiles):
-    Calcula el SHA-256 criptográfico completo liberando el Event Loop mientras el disco gira/lee,
-    maximizando el ancho de banda del bus de almacenamiento (SSD/NVMe).
+    Fase 3 Asíncrona:
+    Calcula el SHA-256 criptográfico completo en un hilo de trabajo nativo liberando el GIL en C.
     """
-    sha256_hash = hashlib.sha256()
-    try:
-        if HAS_AIOFILES:
-            async with aiofiles.open(file_path, "rb") as f:
-                while chunk := await f.read(chunk_size):
-                    sha256_hash.update(chunk)
-            return sha256_hash.hexdigest()
-        else:
-            return await asyncio.to_thread(compute_file_hash, file_path, chunk_size, on_error)
-    except (PermissionError, OSError, FileNotFoundError, IOError) as exc:
-        if on_error:
-            on_error(f"No se pudo leer '{file_path}' (async): {exc}")
-        return None
+    return await asyncio.to_thread(compute_file_hash, file_path, chunk_size, on_error)

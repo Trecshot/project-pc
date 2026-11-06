@@ -13,6 +13,7 @@ import subprocess
 import sys
 
 from datacleaner.security import validate_target_path
+from datacleaner.rules import KeepRule
 
 
 DEFAULT_TASK_NAME = "DataCleaner_Automated_Audit"
@@ -48,19 +49,31 @@ def build_schtasks_create_command(
 ) -> list[str]:
     """
     Construye el vector de argumentos seguros para `schtasks /Create` en Windows.
-    Valida previamente la ruta contra `validate_target_path` (Blacklist).
+    Valida previamente la ruta contra `validate_target_path` (Blacklist) y
+    valida estrictamente la regla contra KeepRule para evitar inyecciones de comandos.
     """
     validated_dir = validate_target_path(target_dir)
     freq = schedule_type.upper().strip()
     if freq not in ("DAILY", "WEEKLY", "MONTHLY"):
         raise ValueError(f"Frecuencia no soportada: {schedule_type}. Use DAILY, WEEKLY o MONTHLY.")
 
+    if isinstance(keep_rule, KeepRule):
+        rule_val = keep_rule.value
+    elif isinstance(keep_rule, str):
+        try:
+            rule_val = KeepRule(keep_rule).value
+        except ValueError:
+            valid_rules = ", ".join([r.value for r in KeepRule])
+            raise ValueError(f"Regla de conservación inválida: '{keep_rule}'. Opciones válidas: {valid_rules}")
+    else:
+        raise ValueError(f"Tipo inválido para keep_rule: {type(keep_rule)}")
+
     if "__compiled__" in globals() or getattr(sys, "frozen", False):
-        task_action = f'"{sys.executable}" quarantine "{validated_dir}" --keep-rule {keep_rule} --yes'
+        task_action = f'"{sys.executable}" quarantine "{validated_dir}" --keep-rule {rule_val} --yes'
     else:
         main_script = (Path(__file__).resolve().parent.parent / "main.py").resolve()
         py_bin = _resolve_background_python()
-        task_action = f'"{py_bin}" "{main_script}" quarantine "{validated_dir}" --keep-rule {keep_rule} --yes'
+        task_action = f'"{py_bin}" "{main_script}" quarantine "{validated_dir}" --keep-rule {rule_val} --yes'
 
     return [
         "schtasks",

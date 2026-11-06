@@ -10,6 +10,7 @@ detectando extensiones manipuladas/ofuscadas y ejecutables camuflados como docum
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
+import zipfile
 
 
 @dataclass
@@ -20,12 +21,16 @@ class FileSignatureReport:
     header_hex: str
     detected_mime: str
     detected_format: str
-    integrity_status: str  # "VERIFIED", "EXTENSION_MISMATCH", "THREAT_EXECUTABLE_CAMOUFLAGED", "TEXT_OR_GENERIC", "EMPTY_OR_UNREADABLE"
+    integrity_status: str  # "VERIFIED", "EXTENSION_MISMATCH", "THREAT_EXECUTABLE_CAMOUFLAGED", "SUSPICIOUS_ARCHIVE_WRAPPER", "TEXT_OR_GENERIC", "EMPTY_OR_UNREADABLE"
     is_anomaly: bool
     forensic_note: str
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+# Extensiones de paquetes Office Open XML (OOXML)
+OOXML_EXTENSIONS: set[str] = {".docx", ".xlsx", ".pptx", ".dotx", ".xltx", ".potx"}
 
 
 # Tabla determinista de firmas binarias (Magic Numbers)
@@ -41,6 +46,18 @@ MAGIC_SIGNATURES: list[tuple[int, bytes, str, str, set[str], bool]] = [
     (0, b"\x7fELF", "application/x-elf", "Linux/Unix ELF Binary", {".elf", ".so", ".bin", ".out", ".o", ""}, True),
     (0, b"\xfe\xed\xfa\xce", "application/x-mach-binary", "macOS Mach-O 32-bit", {".dylib", ".bundle", ".so", ""}, True),
     (0, b"\xfe\xed\xfa\xcf", "application/x-mach-binary", "macOS Mach-O 64-bit", {".dylib", ".bundle", ".so", ""}, True),
+
+    # Scripts de Shell, Interpretes y Automatizaciones Camufladas
+    (0, b"#!/bin/bash", "text/x-shellscript", "Bash Shell Script", {".sh", ".bash"}, True),
+    (0, b"#!/bin/sh", "text/x-shellscript", "POSIX Shell Script", {".sh"}, True),
+    (0, b"#!/usr/bin/env", "text/x-shellscript", "Env Script Shebang", {".sh", ".py", ".rb", ".pl"}, True),
+    (0, b"#!", "text/x-shellscript", "Script Shebang (#!)", {".sh", ".bash", ".py", ".pl"}, True),
+    (0, b"@echo off", "application/x-bat", "Windows Batch Script (@echo off)", {".bat", ".cmd"}, True),
+    (0, b"<#\r\n", "text/x-powershell", "PowerShell Script Block (<#)", {".ps1", ".psm1"}, True),
+    (0, b"<#\n", "text/x-powershell", "PowerShell Script Block (<#)", {".ps1", ".psm1"}, True),
+
+    # Accesos directos y Polyglots de Windows (CWE-434 / OWASP)
+    (0, b"\x4c\x00\x00\x00\x01\x14\x02\x00", "application/x-ms-shortcut", "Windows Shortcut / LNK Binary", {".lnk"}, True),
 
     # Imágenes
     (0, b"\x89PNG\r\n\x1a\n", "image/png", "PNG Image", {".png", ".apng"}, False),
@@ -105,12 +122,99 @@ def read_magic_header(file_path: Path, num_bytes: int = 16) -> bytes | None:
         return None
 
 
+def inspect_ooxml_container(file_path: Path, ext: str, header_hex: str) -> FileSignatureReport | None:
+    """
+    Inspecciona en memoria la estructura interna de un archivo OOXML (.docx, .xlsx, .pptx)
+    sin descomprimirlo a disco. Verifica la presencia de '[Content_Types].xml' o carpetas '_rels'.
+    Detecta contenedores maliciosos que encapsulan ejecutables/scripts (SUSPICIOUS_ARCHIVE_WRAPPER).
+    """
+    try:
+        with zipfile.ZipFile(file_path, "r") as zf:
+            namelist = [n.lower() for n in zf.namelist()]
+            has_content_types = "[content_types].xml" in namelist
+            has_rels = any(n.startswith("_rels/") or "/_rels/" in n for n in namelist)
+
+            if has_content_types or has_rels:
+                return FileSignatureReport(
+                    file_path=str(file_path),
+                    declared_extension=ext,
+                    header_hex=header_hex,
+                    detected_mime="application/vnd.openxmlformats-officedocument",
+                    detected_format=f"Office OOXML Package ({ext.upper()})",
+                    integrity_status="VERIFIED",
+                    is_anomaly=False,
+                    forensic_note="Estructura OOXML legítima verificada ([Content_Types].xml)."
+                )
+
+            # Verificar si encapsula ejecutables o scripts maliciosos
+            DANGEROUS_EXTS = {".exe", ".dll", ".bat", ".cmd", ".ps1", ".vbs", ".sh", ".py", ".elf", ".scr", ".com"}
+            contained_execs = [n for n in zf.namelist() if Path(n).suffix.lower() in DANGEROUS_EXTS]
+            if contained_execs:
+                return FileSignatureReport(
+                    file_path=str(file_path),
+                    declared_extension=ext,
+                    header_hex=header_hex,
+                    detected_mime="application/zip",
+                    detected_format="Contenedor ZIP Malicioso",
+                    integrity_status="SUSPICIOUS_ARCHIVE_WRAPPER",
+                    is_anomaly=True,
+                    forensic_note=(
+                        f"ALERTA FORENSE CRÍTICA: Archivo ofuscado como documento '{ext}', pero es un "
+                        f"archivo ZIP que oculta ejecutables/scripts internos: {contained_execs[:3]}."
+                    )
+                )
+
+            return FileSignatureReport(
+                file_path=str(file_path),
+                declared_extension=ext,
+                header_hex=header_hex,
+                detected_mime="application/zip",
+                detected_format="Archivo ZIP Genérico",
+                integrity_status="EXTENSION_MISMATCH",
+                is_anomaly=True,
+                forensic_note=(
+                    f"Extensión ofuscada: declara '{ext}' pero es un archivo ZIP genérico "
+                    "sin estructura válida de Office ([Content_Types].xml ausente)."
+                )
+            )
+    except (zipfile.BadZipFile, OSError, PermissionError) as exc:
+        return FileSignatureReport(
+            file_path=str(file_path),
+            declared_extension=ext,
+            header_hex=header_hex,
+            detected_mime="application/octet-stream",
+            detected_format="Contenedor ZIP Corrupto o Inválido",
+            integrity_status="EXTENSION_MISMATCH",
+            is_anomaly=True,
+            forensic_note=f"Archivo '{ext}' con cabecera ZIP dañada o ilegible: {exc}."
+        )
+
+
 def analyze_file_signature(file_path: Path) -> FileSignatureReport:
     """
     Analiza la cabecera binaria (primeros 4 a 16 bytes) del archivo y verifica su
     coherencia frente a la extensión declarada.
     """
     ext = file_path.suffix.lower()
+    file_name = file_path.name
+
+    # Detección de Suplantación RTLO (Right-to-Left Override \u202E, CWE-434 / OWASP)
+    if "\u202e" in file_name:
+        return FileSignatureReport(
+            file_path=str(file_path),
+            declared_extension=ext or "(sin ext)",
+            header_hex="",
+            detected_mime="application/x-spoofed-name-rtlo",
+            detected_format="Ataque de Suplantación RTLO (Right-to-Left Override)",
+            integrity_status="THREAT_EXECUTABLE_CAMOUFLAGED",
+            is_anomaly=True,
+            forensic_note=(
+                f"ALERTA FORENSE CRÍTICA (OWASP / CWE-434): Nombre de archivo '{file_name}' "
+                "contiene el carácter invisible de inversión de texto RTLO (\\u202E) "
+                "empleado para falsificar visualmente la extensión real."
+            ),
+        )
+
     header = read_magic_header(file_path, 16)
 
     if header is None or len(header) == 0:
@@ -127,6 +231,31 @@ def analyze_file_signature(file_path: Path) -> FileSignatureReport:
 
     header_hex = " ".join(f"{b:02X}" for b in header[:8])
 
+    # Detección de Scripts HTML / HTA activos camuflados como documentos o imágenes (CWE-434 / OWASP)
+    if ext in DOCUMENT_OR_MEDIA_EXTENSIONS and ext not in {".html", ".htm", ".xhtml", ".svg"}:
+        header_lower = header.lower()
+        if (
+            header_lower.startswith(b"<script")
+            or header_lower.startswith(b"<hta:")
+            or header_lower.startswith(b"<!doctype html")
+            or header_lower.startswith(b"<html")
+            or b"<hta:application" in header_lower
+            or b"<script" in header_lower
+        ):
+            return FileSignatureReport(
+                file_path=str(file_path),
+                declared_extension=ext,
+                header_hex=header_hex,
+                detected_mime="text/html-script",
+                detected_format="Script HTML / HTA Embebido",
+                integrity_status="THREAT_EXECUTABLE_CAMOUFLAGED",
+                is_anomaly=True,
+                forensic_note=(
+                    f"ALERTA FORENSE (OWASP / CWE-434): Archivo '{ext}' contiene código de script "
+                    f"HTML/HTA embebido ({header_hex}) susceptible de ejecución maliciosa."
+                ),
+            )
+
     # Buscar coincidencia en la tabla de Magic Numbers
     matched_sig = None
     for offset, magic_bytes, mime_type, fmt_label, valid_exts, is_exec in MAGIC_SIGNATURES:
@@ -138,7 +267,7 @@ def analyze_file_signature(file_path: Path) -> FileSignatureReport:
     if matched_sig is not None:
         mime_type, fmt_label, valid_exts, is_exec = matched_sig
 
-        # Caso 1: Ejecutable binario camuflado como documento/imagen/multimedia
+        # Caso 1: Ejecutable binario o script camuflado como documento/imagen/multimedia
         if is_exec and ext in DOCUMENT_OR_MEDIA_EXTENSIONS:
             return FileSignatureReport(
                 file_path=str(file_path),
@@ -153,6 +282,12 @@ def analyze_file_signature(file_path: Path) -> FileSignatureReport:
                     f"camuflado con extensión '{ext}'."
                 )
             )
+
+        # Caso 1.1: Paquetes OOXML (.docx, .xlsx, .pptx) con cabecera PK\x03\x04
+        if mime_type == "application/zip" and ext in OOXML_EXTENSIONS:
+            ooxml_rep = inspect_ooxml_container(file_path, ext, header_hex)
+            if ooxml_rep is not None:
+                return ooxml_rep
 
         # Caso 2: La firma binaria real no corresponde con la extensión declarada
         if ext and ext not in valid_exts:
@@ -181,6 +316,23 @@ def analyze_file_signature(file_path: Path) -> FileSignatureReport:
             is_anomaly=False,
             forensic_note=f"Firma íntegra verificada: {fmt_label} ({mime_type})."
         )
+
+    # Detección forense de Bytecode Python (.pyc) camuflado como documento/imagen
+    if ext in DOCUMENT_OR_MEDIA_EXTENSIONS and len(header) >= 4:
+        if (header[2:4] == b"\r\n" or header[1:3] == b"\r\n" or header.endswith(b"\r\r\n")) and header[0] < 0x20:
+            return FileSignatureReport(
+                file_path=str(file_path),
+                declared_extension=ext,
+                header_hex=header_hex,
+                detected_mime="application/x-python-code",
+                detected_format="Python Bytecode (.pyc)",
+                integrity_status="THREAT_EXECUTABLE_CAMOUFLAGED",
+                is_anomaly=True,
+                forensic_note=(
+                    f"ALERTA FORENSE: Código ejecutable Python Bytecode (.pyc) ({header_hex}) "
+                    f"camuflado con extensión '{ext}'."
+                )
+            )
 
     # Si no coincidió con ninguna firma conocida, pero su extensión exige una firma estricta (ej. .pdf, .png, .jpg, .exe)
     if ext in STRICT_BINARY_EXTENSIONS:

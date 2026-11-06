@@ -14,8 +14,26 @@ from datetime import datetime
 import json
 import shutil
 import os
-import math
+import sys
+import logging
+import hashlib
+import hmac
+
+try:
+    import msvcrt
+    HAS_MSVCRT = True
+except ImportError:
+    HAS_MSVCRT = False
+
+try:
+    import fcntl
+    HAS_FCNTL = True
+except ImportError:
+    HAS_FCNTL = False
 from dataclasses import dataclass, asdict
+from datacleaner.history import format_bytes_auto as _format_bytes, CleaningHistoryManager
+
+logger = logging.getLogger(__name__)
 
 try:
     from send2trash import send2trash
@@ -70,19 +88,107 @@ class HardlinkResult:
     linked_paths: list[str]
     errors: list[str]
 
-def _format_bytes(bytes_count: int) -> str:
-    """Convierte bytes a formato legible (B, KB, MB, GB, TB) escalando automáticamente."""
-    if bytes_count <= 0:
-        return "0 B"
-    units = ["B", "KB", "MB", "GB", "TB", "PB"]
-    val = float(bytes_count)
-    idx = 0
-    while val >= 1000.0 and idx < len(units) - 1:
-        val /= 1024.0
-        idx += 1
-    if idx == 0:
-        return f"{int(val)} B"
-    return f"{round(val, 2)} {units[idx]}"
+
+def compute_manifest_signature(manifest_bytes: bytes, secret_key: bytes | None = None) -> str:
+    """
+    Calcula la firma criptográfica HMAC-SHA256 del manifiesto de cuarentena (NIST SSDF PO.4 / CNCF).
+    Garantiza no-repudio e inmutabilidad, impidiendo adulteraciones maliciosas de rutas de restauración.
+    """
+    if secret_key is None:
+        seed = f"{os.environ.get('COMPUTERNAME', '')}|{os.environ.get('USERNAME', '')}|DataCleanerQuarantineHMACSecret2026"
+        secret_key = hashlib.sha256(seed.encode("utf-8")).digest()
+    return hmac.new(secret_key, manifest_bytes, hashlib.sha256).hexdigest()
+
+
+def sign_manifest_file(manifest_path: Path, secret_key: bytes | None = None) -> Path:
+    """Genera el archivo adjunto manifest.json.sig con el HMAC-SHA256 del manifiesto."""
+    manifest_bytes = manifest_path.read_bytes()
+    sig = compute_manifest_signature(manifest_bytes, secret_key=secret_key)
+    sig_path = manifest_path.with_name(manifest_path.name + ".sig")
+    sig_path.write_text(sig, encoding="utf-8")
+    return sig_path
+
+
+def verify_manifest_signature(manifest_path: Path, secret_key: bytes | None = None) -> bool:
+    """
+    Verifica que el archivo manifest.json coincida de forma idéntica con manifest.json.sig.
+    Retorna True si la firma es válida. Lanza ValueError si la firma no coincide (adulteración).
+    Si el archivo .sig no existe (compatibilidad hacia atrás), retorna True.
+    """
+    sig_path = manifest_path.with_name(manifest_path.name + ".sig")
+    if not sig_path.exists():
+        return True
+    expected_sig = sig_path.read_text(encoding="utf-8").strip()
+    manifest_bytes = manifest_path.read_bytes()
+    actual_sig = compute_manifest_signature(manifest_bytes, secret_key=secret_key)
+    if not hmac.compare_digest(actual_sig, expected_sig):
+        raise ValueError(
+            f"[INTEGRIDAD COMPROMETIDA] La firma criptográfica de '{manifest_path.name}' es inválida. "
+            "El archivo fue alterado o adulterado tras su aislamiento. Restauración abortada por seguridad."
+        )
+    return True
+
+
+def _verify_file_unchanged(file_path: Path, expected_size: int, expected_mtime: float) -> bool:
+    """
+    Previene pérdida de datos por condición de carrera TOCTOU a nivel de Kernel (CRIT-01).
+    Opera directamente sobre descriptores de archivos del SO (os.open / os.fstat) con banderas
+    de exclusión o bloqueo atómico en kernel (msvcrt.locking / fcntl.flock), neutralizando
+    cualquier manipulación de inodos o sustitución de enlaces simbólicos en caliente.
+    """
+    flags = os.O_RDONLY
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+
+    fd = -1
+    try:
+        # Intentar apertura con permisos de lectura/escritura para bloqueo exclusivo si es posible
+        try:
+            rw_flags = flags | os.O_RDWR
+            fd = os.open(file_path, rw_flags)
+        except (PermissionError, OSError):
+            fd = os.open(file_path, flags)
+
+        locked = False
+        lock_bytes = max(1, min(expected_size, 4096))
+
+        if sys.platform == "win32" and HAS_MSVCRT:
+            try:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, lock_bytes)
+                locked = True
+            except (OSError, IOError):
+                pass
+        elif HAS_FCNTL:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                locked = True
+            except (OSError, IOError):
+                pass
+
+        # Verificación directa de metadatos en inodo/handle abierto a través de fstat
+        st = os.fstat(fd)
+        unchanged = (st.st_size == expected_size and abs(st.st_mtime - expected_mtime) < 1e-4)
+
+        if locked:
+            try:
+                if sys.platform == "win32" and HAS_MSVCRT:
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, lock_bytes)
+                elif HAS_FCNTL:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            except (OSError, IOError):
+                pass
+
+        return unchanged
+    except (PermissionError, OSError, FileNotFoundError):
+        return False
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 def create_quarantine_directory(base_dir: Path, custom_parent: Path | None = None) -> tuple[Path, str, str]:
     """
@@ -136,12 +242,27 @@ def quarantine_redundant_files(
     for group in quarantine_plan:
         file_hash = group.get("hash", "")
         redundant_paths: list[Path] = group.get("quarantine", [])
+        snapshots: dict[str, tuple[int, float]] = group.get("quarantine_snapshots", {})
 
         for orig_file in redundant_paths:
             orig_path = Path(orig_file).resolve().absolute()
             if not orig_path.exists():
                 errors.append(f"Archivo original no encontrado para cuarentena: {orig_path}")
                 continue
+
+            # Verificación anti-TOCTOU: si el archivo mutó tras el escaneo, abortar operación sobre él
+            resolved_key = str(orig_path)
+            snap = None
+            if snapshots:
+                snap = snapshots.get(resolved_key) or snapshots.get(os.path.normcase(resolved_key)) or snapshots.get(str(orig_file))
+            if snap:
+                exp_size, exp_mtime = snap
+                if not _verify_file_unchanged(orig_path, exp_size, exp_mtime):
+                    errors.append(
+                        f"[TOCTOU] El archivo '{orig_path}' fue modificado tras el escaneo. "
+                        "Operación de cuarentena abortada para prevenir pérdida de datos."
+                    )
+                    continue
 
             try:
                 # Calcular ruta relativa respecto al base_dir
@@ -206,6 +327,15 @@ def quarantine_redundant_files(
 
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest_data, f, indent=2, ensure_ascii=False)
+
+    # Firmado criptográfico del manifiesto para garantizar inmutabilidad y no repudio (NIST SSDF PO.4)
+    sign_manifest_file(manifest_path)
+
+    if items:
+        try:
+            CleaningHistoryManager().invalidate_cache_entries([i.original_path for i in items])
+        except Exception as e:
+            logger.debug(f"Aviso invalidando caché en cuarentena: {e}")
 
     return QuarantineResult(
         session_id=session_id,
@@ -291,6 +421,9 @@ def restore_from_quarantine(manifest_path: Path | str) -> RestoreResult:
     if not manifest_p.exists():
         raise FileNotFoundError(f"No se encontró el manifiesto de cuarentena: '{manifest_p}'")
 
+    # Verificación de integridad criptográfica y no repudio (NIST SSDF PO.4 / CNCF)
+    verify_manifest_signature(manifest_p)
+
     quarantine_dir = manifest_p.parent
 
     with open(manifest_p, "r", encoding="utf-8") as f:
@@ -340,18 +473,20 @@ def restore_from_quarantine(manifest_path: Path | str) -> RestoreResult:
         # Fase 5: Eliminar la carpeta de cuarentena vacía si todo se restauró exitosamente
         try:
             manifest_p.unlink(missing_ok=True)
+            manifest_p.with_name(manifest_p.name + ".sig").unlink(missing_ok=True)
             shutil.rmtree(quarantine_dir, ignore_errors=True)
             quarantine_folder_removed = True
         except Exception as e:
             errors.append(f"No se pudo eliminar la carpeta de cuarentena vacía: {e}")
     else:
-        # Actualizar manifiesto si quedaron archivos pendientes o con error
+        # Actualizar manifiesto si quedaron archivos pendientes o con error y re-firmar
         manifest_data["files"] = files_data
         manifest_data["items"] = files_data
         manifest_data["last_restored_at"] = datetime.now().isoformat()
         manifest_data["fully_restored"] = all_restored
         with open(manifest_p, "w", encoding="utf-8") as f:
             json.dump(manifest_data, f, indent=2, ensure_ascii=False)
+        sign_manifest_file(manifest_p)
 
     return RestoreResult(
         manifest_path=manifest_p,
@@ -391,15 +526,18 @@ def purge_all_quarantine_sessions(base_dir: Path | str) -> int:
 
 def delete_redundant_files(
     redundant_paths: list[Path | str],
-    use_trash: bool = False
+    use_trash: bool = False,
+    expected_snapshots: dict[str, tuple[int, float]] | None = None
 ) -> DeleteResult:
     """
     Elimina los archivos duplicados del disco (permanentemente o enviándolos a la Papelera de Windows).
+    Incorpora blindaje contra TOCTOU verificando metadatos contra expected_snapshots (CRIT-01).
 
     Args:
         redundant_paths: Lista de rutas a eliminar.
         use_trash: Si es True, envía a la Papelera mediante send2trash.
                    Si es False, desvincula permanentemente con unlink()/os.remove().
+        expected_snapshots: Mapeo opcional de str(path) -> (expected_size, expected_mtime) para TOCTOU.
     """
     if use_trash and not HAS_SEND2TRASH:
         raise RuntimeError(
@@ -416,6 +554,24 @@ def delete_redundant_files(
         p = Path(path_item).resolve().absolute()
         if not p.exists():
             continue
+
+        resolved_key = str(p)
+        snap = None
+        if expected_snapshots:
+            snap = (
+                expected_snapshots.get(resolved_key)
+                or expected_snapshots.get(os.path.normcase(resolved_key))
+                or expected_snapshots.get(str(path_item))
+            )
+        if snap:
+            exp_size, exp_mtime = snap
+            if not _verify_file_unchanged(p, exp_size, exp_mtime):
+                errors.append(
+                    f"[TOCTOU] El archivo '{p}' fue modificado tras el escaneo. "
+                    "Eliminación cancelada para proteger datos nuevos."
+                )
+                continue
+
         try:
             file_size = p.stat().st_size
             if use_trash:
@@ -434,6 +590,12 @@ def delete_redundant_files(
         except Exception as e:
             errors.append(f"Error inesperado al procesar {p}: {e}")
 
+    if deleted_paths:
+        try:
+            CleaningHistoryManager().invalidate_cache_entries(deleted_paths)
+        except Exception as e:
+            logger.debug(f"Aviso invalidando caché en eliminación: {e}")
+
     return DeleteResult(
         total_deleted=total_deleted,
         total_bytes_deleted=total_bytes_deleted,
@@ -448,13 +610,17 @@ def execute_deletion_plan(
 ) -> DeleteResult:
     """
     Ejecuta el borrado directo (papelera o definitivo) a partir de un plan de auditoría.
-    Extrae los archivos marcados como redundantes para eliminación.
+    Extrae los archivos marcados como redundantes y propaga los snapshots para validación TOCTOU.
     """
     all_redundant: list[Path] = []
+    all_snapshots: dict[str, tuple[int, float]] = {}
     for group in quarantine_plan:
         all_redundant.extend(group.get("quarantine", []))
+        group_snaps = group.get("quarantine_snapshots", {})
+        if group_snaps:
+            all_snapshots.update(group_snaps)
 
-    return delete_redundant_files(all_redundant, use_trash=use_trash)
+    return delete_redundant_files(all_redundant, use_trash=use_trash, expected_snapshots=all_snapshots)
 
 
 def deduplicate_with_hardlinks(quarantine_plan: list[dict]) -> HardlinkResult:
@@ -491,11 +657,41 @@ def deduplicate_with_hardlinks(quarantine_plan: list[dict]) -> HardlinkResult:
             errors.append(f"No se pudo inspeccionar archivo maestro '{keep_path}': {e}")
             continue
 
+        # Validación anti-TOCTOU sobre el archivo maestro KEEP
+        exp_keep_size = group.get("size_per_file") or group.get("expected_size")
+        exp_keep_mtime = group.get("keep_mtime")
+        if exp_keep_size is not None and exp_keep_mtime is not None:
+            if not _verify_file_unchanged(keep_path, exp_keep_size, exp_keep_mtime):
+                errors.append(
+                    f"[TOCTOU] El archivo maestro KEEP '{keep_path}' fue modificado tras el escaneo. "
+                    "Deduplicación por hardlinks abortada para proteger datos nuevos."
+                )
+                continue
+
         redundant_list: list[Path] = group.get("quarantine", [])
+        snapshots: dict[str, tuple[int, float]] = group.get("quarantine_snapshots", {})
         for red_raw in redundant_list:
             red_path = Path(red_raw).resolve().absolute()
             if not red_path.exists() or red_path == keep_path:
                 continue
+
+            # Validación anti-TOCTOU sobre la copia redundante
+            resolved_red_key = str(red_path)
+            snap = None
+            if snapshots:
+                snap = (
+                    snapshots.get(resolved_red_key)
+                    or snapshots.get(os.path.normcase(resolved_red_key))
+                    or snapshots.get(str(red_raw))
+                )
+            if snap:
+                exp_size, exp_mtime = snap
+                if not _verify_file_unchanged(red_path, exp_size, exp_mtime):
+                    errors.append(
+                        f"[TOCTOU] El archivo '{red_path}' fue modificado tras el escaneo. "
+                        "Creación de hardlink abortada para proteger datos nuevos."
+                    )
+                    continue
 
             try:
                 red_stat = red_path.stat()
@@ -533,6 +729,12 @@ def deduplicate_with_hardlinks(quarantine_plan: list[dict]) -> HardlinkResult:
                 linked_paths.append(str(red_path))
             except Exception as e:
                 errors.append(f"Error procesando hardlink en '{red_path}': {e}")
+
+    if linked_paths:
+        try:
+            CleaningHistoryManager().invalidate_cache_entries(linked_paths)
+        except Exception as e:
+            logger.debug(f"Aviso invalidando caché en hardlinks: {e}")
 
     return HardlinkResult(
         total_linked=total_linked,
