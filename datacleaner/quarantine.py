@@ -95,8 +95,8 @@ def compute_manifest_signature(manifest_bytes: bytes, secret_key: bytes | None =
     Garantiza no-repudio e inmutabilidad, impidiendo adulteraciones maliciosas de rutas de restauración.
     """
     if secret_key is None:
-        seed = f"{os.environ.get('COMPUTERNAME', '')}|{os.environ.get('USERNAME', '')}|DataCleanerQuarantineHMACSecret2026"
-        secret_key = hashlib.sha256(seed.encode("utf-8")).digest()
+        from datacleaner.security import get_audit_secret_key
+        secret_key = get_audit_secret_key()
     return hmac.new(secret_key, manifest_bytes, hashlib.sha256).hexdigest()
 
 
@@ -129,12 +129,18 @@ def verify_manifest_signature(manifest_path: Path, secret_key: bytes | None = No
     return True
 
 
-def _verify_file_unchanged(file_path: Path, expected_size: int, expected_mtime: float) -> bool:
+def _verify_file_unchanged(
+    file_path: Path,
+    expected_size: int,
+    expected_mtime: float,
+    verified_stat: dict[str, Any] | None = None,
+) -> bool:
     """
-    Previene pérdida de datos por condición de carrera TOCTOU a nivel de Kernel (CRIT-01).
+    Previene pérdida de datos por condición de carrera TOCTOU a nivel de Kernel (CRIT-01 / Auditoría D).
     Opera directamente sobre descriptores de archivos del SO (os.open / os.fstat) con banderas
     de exclusión o bloqueo atómico en kernel (msvcrt.locking / fcntl.flock), neutralizando
     cualquier manipulación de inodos o sustitución de enlaces simbólicos en caliente.
+    Captura st_size y st_mtime atómicamente si se provee 'verified_stat', cerrando la micro-ventana TOCTOU.
     """
     flags = os.O_RDONLY
     if hasattr(os, "O_BINARY"):
@@ -170,6 +176,10 @@ def _verify_file_unchanged(file_path: Path, expected_size: int, expected_mtime: 
         # Verificación directa de metadatos en inodo/handle abierto a través de fstat
         st = os.fstat(fd)
         unchanged = (st.st_size == expected_size and abs(st.st_mtime - expected_mtime) < 1e-4)
+
+        if unchanged and verified_stat is not None:
+            verified_stat["size"] = st.st_size
+            verified_stat["mtime"] = st.st_mtime
 
         if locked:
             try:
@@ -250,20 +260,6 @@ def quarantine_redundant_files(
                 errors.append(f"Archivo original no encontrado para cuarentena: {orig_path}")
                 continue
 
-            # Verificación anti-TOCTOU: si el archivo mutó tras el escaneo, abortar operación sobre él
-            resolved_key = str(orig_path)
-            snap = None
-            if snapshots:
-                snap = snapshots.get(resolved_key) or snapshots.get(os.path.normcase(resolved_key)) or snapshots.get(str(orig_file))
-            if snap:
-                exp_size, exp_mtime = snap
-                if not _verify_file_unchanged(orig_path, exp_size, exp_mtime):
-                    errors.append(
-                        f"[TOCTOU] El archivo '{orig_path}' fue modificado tras el escaneo. "
-                        "Operación de cuarentena abortada para prevenir pérdida de datos."
-                    )
-                    continue
-
             try:
                 # Calcular ruta relativa respecto al base_dir
                 try:
@@ -288,11 +284,30 @@ def quarantine_redundant_files(
 
                 dest_file.parent.mkdir(parents=True, exist_ok=True)
 
-                stat = orig_path.stat()
-                file_size = stat.st_size
-                mtime = stat.st_mtime
+                # Verificación anti-TOCTOU: si el archivo mutó tras el escaneo, abortar operación sobre él
+                # Captura atómicamente st_size y st_mtime en el kernel fd para evitar un segundo stat()
+                resolved_key = str(orig_path)
+                snap = None
+                if snapshots:
+                    snap = snapshots.get(resolved_key) or snapshots.get(os.path.normcase(resolved_key)) or snapshots.get(str(orig_file))
 
-                # Mover archivo de manera no destructiva (soft-delete)
+                verified_stat: dict[str, Any] = {}
+                if snap:
+                    exp_size, exp_mtime = snap
+                    if not _verify_file_unchanged(orig_path, exp_size, exp_mtime, verified_stat):
+                        errors.append(
+                            f"[TOCTOU] El archivo '{orig_path}' fue modificado tras el escaneo. "
+                            "Operación de cuarentena abortada para prevenir pérdida de datos."
+                        )
+                        continue
+                    file_size = verified_stat.get("size", exp_size)
+                    mtime = verified_stat.get("mtime", exp_mtime)
+                else:
+                    stat = orig_path.stat()
+                    file_size = stat.st_size
+                    mtime = stat.st_mtime
+
+                # Mover archivo de manera no destructiva (soft-delete) inmediatamente tras cerrar fd
                 shutil.move(str(orig_path), str(dest_file))
 
                 item = QuarantineItem(
@@ -563,17 +578,24 @@ def delete_redundant_files(
                 or expected_snapshots.get(os.path.normcase(resolved_key))
                 or expected_snapshots.get(str(path_item))
             )
+        verified_stat: dict[str, Any] = {}
         if snap:
             exp_size, exp_mtime = snap
-            if not _verify_file_unchanged(p, exp_size, exp_mtime):
+            if not _verify_file_unchanged(p, exp_size, exp_mtime, verified_stat):
                 errors.append(
                     f"[TOCTOU] El archivo '{p}' fue modificado tras el escaneo. "
                     "Eliminación cancelada para proteger datos nuevos."
                 )
                 continue
+            file_size = verified_stat.get("size", exp_size)
+        else:
+            try:
+                file_size = p.stat().st_size
+            except OSError as e:
+                errors.append(f"Error al obtener metadatos de {p}: {e}")
+                continue
 
         try:
-            file_size = p.stat().st_size
             if use_trash:
                 if HAS_SEND2TRASH:
                     send2trash(str(p))

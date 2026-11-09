@@ -53,12 +53,9 @@ def get_utc_timestamp() -> str:
 
 
 def _get_audit_secret_key() -> bytes:
-    """Obtiene la clave de auditoría del entorno o almacén seguro del SO (Falla 3)."""
-    env_key = os.environ.get("DATACLEANER_AUDIT_KEY")
-    if env_key:
-        return env_key.encode("utf-8")
-    machine_id = f"{os.environ.get('COMPUTERNAME', 'local')}_{os.environ.get('USERNAME', 'user')}"
-    return hashlib.sha256(machine_id.encode("utf-8")).digest()
+    """Obtiene la clave de auditoría del entorno o almacén seguro del SO (Falla 3 / Auditoría C)."""
+    from datacleaner.security import get_audit_secret_key
+    return get_audit_secret_key()
 
 
 def compute_entry_hmac(prev_hash: str, entry_id: str, timestamp: str, action_type: str, target_dir: str, files_count: int, bytes_count: int) -> str:
@@ -211,8 +208,8 @@ def _harden_file_permissions(file_path: Path) -> None:
             # Eliminar herencia y restringir acceso exclusivamente al usuario propietario actual (Windows DACL)
             username = os.environ.get("USERNAME")
             if username:
-                # CORRECCIÓN: Lista de argumentos sin shell=True para mitigar CWE-78
-                cmd = ["icacls", str(file_path), "/inheritance:r", "/grant:r", f"{username}:(R,W)"]
+                # Restringir acceso exclusivamente al usuario propietario actual (Windows DACL)
+                cmd = ["icacls", str(file_path), "/inheritance:r", "/grant:r", f"{username}:(F)"]
                 subprocess.run(cmd, shell=False, capture_output=True, check=False)
     except (OSError, Exception) as e:
         logger.debug(f"No se pudieron ajustar permisos para {file_path}: {e}")

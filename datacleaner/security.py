@@ -13,6 +13,12 @@ import os
 import platform
 import tempfile
 import sys
+import secrets
+import hashlib
+import subprocess
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def _build_system_blacklist() -> list[Path]:
@@ -248,3 +254,77 @@ def validate_target_path(target_path: str | Path, must_be_dir: bool = True) -> P
         raise NotADirectoryError(f"La ruta especificada debe ser un directorio: '{resolved_target}'")
 
     return resolved_target
+
+
+_CACHED_AUDIT_SECRET_KEY: bytes | None = None
+
+
+def get_audit_secret_key(force_refresh: bool = False) -> bytes:
+    """
+    Obtiene o deriva la clave secreta criptográfica de auditoría (HMAC-SHA256).
+    Jerarquía de resolución (NIST SSDF PO.4 / OWASP Cryptographic Storage):
+    1. Variable de entorno 'DATACLEANER_AUDIT_KEY' si está definida.
+    2. Archivo protegido local (.audit_key) en %LOCALAPPDATA%\\DataCleaner o ~/.local/share/datacleaner.
+       Si no existe, genera 32 bytes de alta entropía (secrets.token_bytes(32)) y restringe su acceso por ACL/chmod.
+    3. Fallback determinista salteado en caso de entornos de sólo lectura o sin almacenamiento local.
+    """
+    global _CACHED_AUDIT_SECRET_KEY
+    if _CACHED_AUDIT_SECRET_KEY is not None and not force_refresh:
+        return _CACHED_AUDIT_SECRET_KEY
+
+    # 1. Variable de entorno explícita
+    env_key = os.environ.get("DATACLEANER_AUDIT_KEY")
+    if env_key:
+        _CACHED_AUDIT_SECRET_KEY = env_key.encode("utf-8")
+        return _CACHED_AUDIT_SECRET_KEY
+
+    # 2. Almacén persistente local seguro
+    try:
+        if sys.platform == "win32":
+            base_dir = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+            storage_dir = Path(base_dir) / "DataCleaner" if base_dir else Path.home() / ".datacleaner"
+        else:
+            storage_dir = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share")) / "datacleaner"
+
+        key_file = storage_dir / ".audit_key"
+
+        if key_file.is_file():
+            raw_key = key_file.read_bytes()
+            if len(raw_key) >= 32:
+                _CACHED_AUDIT_SECRET_KEY = raw_key[:32]
+                return _CACHED_AUDIT_SECRET_KEY
+
+        # Generar nueva clave criptográfica aleatoria de 256 bits (secrets.token_bytes)
+        storage_dir.mkdir(parents=True, exist_ok=True)
+        new_key = secrets.token_bytes(32)
+        key_file.write_bytes(new_key)
+
+        # Endurecer permisos (Principio de Menor Privilegio: ACL en Windows / chmod 0600 en Unix)
+        try:
+            if sys.platform == "win32":
+                username = os.environ.get("USERNAME")
+                if username:
+                    subprocess.run(
+                        ["icacls", str(key_file), "/inheritance:r", "/grant:r", f"{username}:(F)"],
+                        capture_output=True,
+                        check=False,
+                        shell=False,
+                    )
+            else:
+                os.chmod(key_file, 0o600)
+        except Exception:
+            pass
+
+        _CACHED_AUDIT_SECRET_KEY = new_key
+        return _CACHED_AUDIT_SECRET_KEY
+
+    except Exception as e:
+        # 3. Fallback criptográfico seguro: clave efímera aleatoria de 256 bits en RAM
+        logger.warning(
+            "No se pudo acceder ni persistir la clave de auditoría en el almacén local (%s). "
+            "Generando clave efímera de 256 bits puramente aleatoria en memoria RAM para esta sesión.",
+            e
+        )
+        _CACHED_AUDIT_SECRET_KEY = secrets.token_bytes(32)
+        return _CACHED_AUDIT_SECRET_KEY
+

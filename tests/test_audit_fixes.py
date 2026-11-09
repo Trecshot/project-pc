@@ -389,6 +389,151 @@ class TestAuditFindingsFixes(unittest.TestCase):
         self.assertIn("NIST SSDF", text)
         self.assertIn("GPG", text)
 
+    def test_audit_point_a_clean_workspace_artifacts(self):
+        """Auditoría A: Limpieza de artefactos compilados y bases SQLite locales."""
+        import build_executable
+        fake_root = self.base_path / "fake_clean_root"
+        fake_root.mkdir()
+        pycache_dir = fake_root / "pkg" / "__pycache__"
+        pycache_dir.mkdir(parents=True)
+        (pycache_dir / "mod.cpython-315.pyc").write_bytes(b"pyc-bytecode")
+        (fake_root / ".datacleaner.sqlite").write_bytes(b"sqlite-database")
+
+        cleaned = build_executable.clean_workspace_artifacts(fake_root)
+        self.assertGreaterEqual(cleaned, 2)
+        self.assertFalse(pycache_dir.exists())
+        self.assertFalse((fake_root / ".datacleaner.sqlite").exists())
+
+    def test_audit_point_b_phase1_size_grouping_without_bloom_overhead(self):
+        """Auditoría B: Agrupación instantánea en RAM en C-dict y actualización cooperativa de BloomFilter."""
+        from datacleaner.scanner import scan_directory_for_duplicates
+        from datacleaner.bloom import BloomFilter
+
+        test_dir = self.base_path / "audit_b_dir"
+        test_dir.mkdir()
+        f1 = test_dir / "file1.txt"
+        f2 = test_dir / "file2.txt"
+        f3 = test_dir / "unique.txt"
+        f1.write_bytes(b"A" * 50)
+        f2.write_bytes(b"A" * 50)
+        f3.write_bytes(b"B" * 30)
+
+        # 1. Escaneo por defecto: no requiere crear BloomFilter en hot-path
+        dups, summary = scan_directory_for_duplicates(test_dir)
+        self.assertEqual(len(dups), 1)
+        self.assertEqual(summary.size_unique_discarded, 1)
+
+        # 2. Escaneo con custom bloom: se actualiza transparentemente
+        custom_bf = BloomFilter(expected_elements=100)
+        dups2, summary2 = scan_directory_for_duplicates(test_dir, bloom_filter=custom_bf)
+        self.assertEqual(len(dups2), 1)
+        self.assertTrue(50 in custom_bf)
+        self.assertTrue(30 in custom_bf)
+
+    def test_audit_point_c_cryptographic_audit_secret_key(self):
+        """Auditoría C: Derivación y persistencia de clave HMAC de 256 bits aleatoria (NIST SSDF PO.4)."""
+        from datacleaner.security import get_audit_secret_key
+        from datacleaner.history import _get_audit_secret_key
+        from datacleaner.quarantine import compute_manifest_signature
+
+        # 1. La clave obtenida tiene 32 bytes (256 bits) de entropía
+        k1 = get_audit_secret_key(force_refresh=True)
+        self.assertIsInstance(k1, bytes)
+        self.assertEqual(len(k1), 32)
+
+        # 2. History y Quarantine comparten la misma clave común
+        k2 = _get_audit_secret_key()
+        self.assertEqual(k1, k2)
+
+        sig1 = compute_manifest_signature(b'{"test": 1}')
+        sig2 = compute_manifest_signature(b'{"test": 1}', secret_key=k1)
+        self.assertEqual(sig1, sig2)
+
+        # 3. Soporte para DATACLEANER_AUDIT_KEY personalizada
+        old_env = os.environ.get("DATACLEANER_AUDIT_KEY")
+        try:
+            os.environ["DATACLEANER_AUDIT_KEY"] = "CustomTestKey12345678901234567890"
+            k_custom = get_audit_secret_key(force_refresh=True)
+            self.assertEqual(k_custom, b"CustomTestKey12345678901234567890")
+        finally:
+            if old_env is not None:
+                os.environ["DATACLEANER_AUDIT_KEY"] = old_env
+            else:
+                os.environ.pop("DATACLEANER_AUDIT_KEY", None)
+            get_audit_secret_key(force_refresh=True)
+
+    def test_audit_point_d_micro_toctou_verified_stat_capture(self):
+        """Auditoría D: _verify_file_unchanged captura st_size y st_mtime en el kernel fd eliminando re-stat."""
+        from datacleaner.quarantine import _verify_file_unchanged
+        tf = self.base_path / "toctou_capture.bin"
+        tf.write_bytes(b"TOCTOU Atomic Capture Payload")
+        st = tf.stat()
+
+        stat_collector = {}
+        res = _verify_file_unchanged(tf, st.st_size, st.st_mtime, verified_stat=stat_collector)
+        self.assertTrue(res)
+        self.assertEqual(stat_collector.get("size"), st.st_size)
+        self.assertAlmostEqual(stat_collector.get("mtime"), st.st_mtime, delta=1e-4)
+
+    def test_audit_residual_a_ephemeral_random_fallback_key(self):
+        """Auditoría Residual A: Si el almacén local falla, la clave de fallback es aleatoria en RAM (no determinista)."""
+        from unittest.mock import patch
+        from datacleaner.security import get_audit_secret_key
+
+        real_is_file = Path.is_file
+
+        def fail_is_file(self):
+            if str(self).endswith(".audit_key"):
+                return False
+            return real_is_file(self)
+
+        with patch.object(Path, "is_file", new=fail_is_file), \
+             patch("pathlib.Path.mkdir", side_effect=PermissionError("Almacén protegido contra escritura")):
+            k_fallback_1 = get_audit_secret_key(force_refresh=True)
+            k_fallback_2 = get_audit_secret_key(force_refresh=True)
+
+            self.assertEqual(len(k_fallback_1), 32)
+            self.assertEqual(len(k_fallback_2), 32)
+            # Debe ser puramente aleatoria y no basada en COMPUTERNAME ni USERNAME
+            self.assertNotEqual(k_fallback_1, k_fallback_2)
+            # Restaurar
+            get_audit_secret_key(force_refresh=True)
+
+    def test_audit_residual_c_virtual_fs_inode_collision_protection(self):
+        """Auditoría Residual C: Solo st_nlink > 1 se trata como hardlink; archivos con nlink==1 no sufren falso positivo."""
+        from datacleaner.scanner import scan_directory_for_duplicates
+        from unittest.mock import patch
+
+        vfs_dir = self.base_path / "vfs_test"
+        vfs_dir.mkdir()
+        f1 = vfs_dir / "doc1.txt"
+        f2 = vfs_dir / "doc2.txt"
+        f1.write_bytes(b"Shared Content")
+        f2.write_bytes(b"Shared Content")
+
+        real_stat = Path.stat
+
+        def mock_stat(self, *args, **kwargs):
+            st = real_stat(self, *args, **kwargs)
+            if self in (f1, f2):
+                # Simular sistema de archivos virtual donde st_ino colisiona a 99999 pero st_nlink es 1 (sin enlace real)
+                class MockStatResult:
+                    st_size = st.st_size
+                    st_mtime = st.st_mtime
+                    st_dev = 1
+                    st_ino = 99999
+                    st_nlink = 1
+                    st_file_attributes = getattr(st, "st_file_attributes", 0)
+                return MockStatResult()
+            return st
+
+        with patch.object(Path, "stat", new=mock_stat):
+            dups, summary = scan_directory_for_duplicates(vfs_dir)
+            # Ambos archivos deben ser evaluados como duplicados normales, NO omitidos como hardlink preexistente
+            self.assertEqual(summary.already_hardlinked_skipped, 0)
+            self.assertEqual(len(dups), 1)
+
+
 
 if __name__ == "__main__":
     import sys

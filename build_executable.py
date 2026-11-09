@@ -146,8 +146,54 @@ def sign_artifact(binary_path: Path) -> bool:
         return False
 
 
+def clean_workspace_artifacts(root_dir: Path | None = None) -> int:
+    """
+    Limpia artefactos binarios compilados y bases de datos locales del árbol de trabajo (Auditoría A).
+    Elimina archivos *.pyc, carpetas __pycache__, .datacleaner.sqlite* y .pytest_cache
+    para evitar fuga de rutas locales y sobrepeso en la distribución.
+    """
+    root = (root_dir or Path(__file__).resolve().parent).resolve()
+    removed_count = 0
+    import shutil
+
+    # Eliminar carpetas de caché
+    for cache_dir in list(root.rglob("__pycache__")) + list(root.glob(".pytest_cache")):
+        if cache_dir.exists():
+            try:
+                shutil.rmtree(cache_dir, ignore_errors=True)
+                removed_count += 1
+            except Exception:
+                pass
+
+    # Eliminar archivos .pyc sueltos y bases SQLite locales
+    for f in list(root.rglob("*.pyc")) + list(root.rglob("*.pyo")):
+        if f.is_file():
+            try:
+                f.unlink(missing_ok=True)
+                removed_count += 1
+            except Exception:
+                pass
+
+    for f in root.iterdir():
+        if f.is_file() and f.name.startswith(".datacleaner.sqlite"):
+            try:
+                if sys.platform == "win32":
+                    subprocess.run(["icacls", str(f), "/reset"], capture_output=True, check=False)
+                f.unlink(missing_ok=True)
+                removed_count += 1
+            except Exception:
+                pass
+
+    return removed_count
+
+
 def build() -> int:
     root_dir = Path(__file__).resolve().parent
+    # Limpieza previa de artefactos binarios y cachés locales (Auditoría A)
+    cleaned = clean_workspace_artifacts(root_dir)
+    if cleaned > 0:
+        print(f"[CLEANUP] Eliminados {cleaned} artefactos/directorios de caché residuales.")
+
     assets_dir = root_dir / "datacleaner" / "assets"
     assets_dir.mkdir(parents=True, exist_ok=True)
 
@@ -180,4 +226,8 @@ def build() -> int:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] in ("--clean", "-c"):
+        n = clean_workspace_artifacts()
+        print(f"[CLEANUP] Árbol de trabajo limpio: {n} artefactos/cachés eliminados.")
+        sys.exit(0)
     sys.exit(build())

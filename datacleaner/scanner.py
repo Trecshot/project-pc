@@ -168,9 +168,8 @@ def scan_directory_for_duplicates(
             warning_callback(msg)
 
     # =========================================================================
-    # FASE 1: Recorrido O(1) en RAM + Detección de Hardlinks con Filtro de Bloom
+    # FASE 1: Recorrido O(1) en RAM + Detección de Hardlinks (Auditoría B y E)
     # =========================================================================
-    bloom = bloom_filter or BloomFilter(expected_elements=1_000_000, false_positive_rate=0.005)
     pending_unique: dict[int, Path] = {}
     colliding_size_map: dict[int, list[Path]] = {}
     seen_inodes_per_size: dict[int, set[tuple[int, int]]] = {}
@@ -181,15 +180,11 @@ def scan_directory_for_duplicates(
             log_warning("Auditoría cancelada por el usuario en Fase 1.")
             return {}, summary
 
-        # CORRECCIÓN CRÍTICA 1: Proteger archivos estructurales y entornos virtuales
-        if is_protected_dev_resource(file_path):
-            continue
-
         try:
             stat = file_path.stat(follow_symlinks=False)
             file_size = stat.st_size
 
-            # CORRECCIÓN CRÍTICA 2: Ignorar archivos de 0 bytes por defecto
+            # Ignorar archivos de 0 bytes por defecto
             if file_size == 0 and not include_empty_files:
                 continue
 
@@ -197,30 +192,32 @@ def scan_directory_for_duplicates(
             summary.total_bytes_scanned += file_size
 
             # Omitir archivos que ya comparten inodo físico (Hardlinks existentes)
-            inode_key = (getattr(stat, "st_dev", 0), getattr(stat, "st_ino", 0))
-            if inode_key[1] != 0:
+            # Solo los archivos con más de un enlace físico (st_nlink > 1) pueden ser hardlinks.
+            # Esto previene falsos positivos en sistemas de archivos virtuales o de red (SMB/Dokan/WinFsp)
+            # donde st_ino puede colisionar sintéticamente reportando st_nlink == 1 (Auditoría C).
+            nlink = getattr(stat, "st_nlink", 1)
+            inode_num = getattr(stat, "st_ino", 0)
+            if nlink > 1 and inode_num != 0:
+                inode_key = (getattr(stat, "st_dev", 0), inode_num)
                 inodes_set = seen_inodes_per_size.setdefault(file_size, set())
                 if inode_key in inodes_set:
                     summary.already_hardlinked_skipped += 1
                     continue
                 inodes_set.add(inode_key)
 
-            # Clasificación O(1) mediante Filtro de Bloom en RAM:
-            # 1. Si file_size NO está en el filtro de Bloom (cero falsos negativos),
-            #    es 100% seguro la primera vez que se observa. Se agrega al filtro y a pending_unique.
-            if file_size not in bloom:
-                bloom.add(file_size)
-                pending_unique[file_size] = file_path
+            # Clasificación O(1) nativa en RAM con tabla hash en C (Auditoría B):
+            # Elimina sobrecarga redundante de hashing en Python puro manteniendo
+            # telemetría y actualización opcional de BloomFilter si fue provisto.
+            if file_size in colliding_size_map:
+                colliding_size_map[file_size].append(file_path)
+            elif file_size in pending_unique:
+                first_fp = pending_unique.pop(file_size)
+                colliding_size_map[file_size] = [first_fp, file_path]
             else:
-                # 2. El filtro de Bloom indica que el tamaño ya fue visto (potencial colisión).
-                if file_size in pending_unique:
-                    first_fp = pending_unique.pop(file_size)
-                    colliding_size_map[file_size] = [first_fp, file_path]
-                elif file_size in colliding_size_map:
-                    colliding_size_map[file_size].append(file_path)
-                else:
-                    # Falso positivo infrecuente de Bloom (<0.5%): registrar como primer elemento real
-                    pending_unique[file_size] = file_path
+                pending_unique[file_size] = file_path
+
+            if bloom_filter is not None:
+                bloom_filter.add(file_size)
 
         except (PermissionError, OSError) as e:
             summary.unreadable_files_count += 1
