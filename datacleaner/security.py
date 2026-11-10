@@ -14,7 +14,6 @@ import platform
 import tempfile
 import sys
 import secrets
-import hashlib
 import subprocess
 import logging
 
