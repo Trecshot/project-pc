@@ -277,7 +277,7 @@ class TestAuditFindingsFixes(unittest.TestCase):
         self.assertIn("pytest tests/ -v", content)
         self.assertIn("cyclonedx-bom", content)
         self.assertIn("actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11", content)
-        self.assertIn("actions/setup-python@0a5c61591373683505ea898e09a6ea8db8ce1b6a", content)
+        self.assertIn("actions/setup-python@0a5c61591373683505ea898e09a3ea4f39ef2b9c", content)
 
     def test_quarantine_manifest_cryptographic_signing_and_tamper_detection(self):
         """NIST PO.4: Manifiesto firmado criptográficamente; detecta alteraciones y aborta la restauración."""
@@ -523,6 +523,7 @@ class TestAuditFindingsFixes(unittest.TestCase):
                     st_dev = 1
                     st_ino = 99999
                     st_nlink = 1
+                    st_mode = getattr(st, "st_mode", 0o100666)
                     st_file_attributes = getattr(st, "st_file_attributes", 0)
                 return MockStatResult()
             return st
