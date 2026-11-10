@@ -835,6 +835,61 @@ class TestAuditFindingsFixes(unittest.TestCase):
         self.assertGreaterEqual(removed, 1)
         self.assertFalse(bundle_dir.exists())
 
+    def test_reflink_cow_and_hardlink_fallback_pipeline(self):
+        """Auditoría Reflink CoW: deduplicate_with_hardlinks prueba Reflink CoW y desciende a Hardlink si no hay soporte."""
+        from unittest.mock import patch
+        from datacleaner.quarantine import deduplicate_with_hardlinks, clone_file_cow
+
+        sub_test_dir = self.base_path / "reflink_test"
+        sub_test_dir.mkdir()
+        f1 = sub_test_dir / "master_cow.bin"
+        f2 = sub_test_dir / "dup_cow.bin"
+        content = b"Reflink Block Cloning / Copy-on-Write Test Payload 2026"
+        f1.write_bytes(content)
+        f2.write_bytes(content)
+
+        dups, _ = scan_directory_for_duplicates(sub_test_dir)
+        plan = build_audit_plan(dups)
+
+        # 1. Simulación cuando clone_file_cow tiene éxito (Reflink nativo ReFS / DevDrive / APFS / Btrfs)
+        with patch("datacleaner.quarantine.clone_file_cow", return_value=True) as mock_cow:
+            res = deduplicate_with_hardlinks(plan)
+            self.assertEqual(res.total_linked, 1)
+            self.assertEqual(res.total_reflinked, 1)
+            self.assertEqual(res.total_bytes_saved, len(content))
+            self.assertTrue(mock_cow.called)
+
+        # 2. Simulación cuando clone_file_cow retorna False (volumen sin soporte CoW -> fallback a os.link)
+        f3 = sub_test_dir / "master_fallback.bin"
+        f4 = sub_test_dir / "dup_fallback.bin"
+        f3.write_bytes(b"Fallback Content 123456")
+        f4.write_bytes(b"Fallback Content 123456")
+        dups2, _ = scan_directory_for_duplicates(sub_test_dir)
+        plan2 = build_audit_plan(dups2)
+
+        with patch("datacleaner.quarantine.clone_file_cow", return_value=False):
+            res2 = deduplicate_with_hardlinks(plan2)
+            self.assertGreaterEqual(res2.total_linked, 1)
+            self.assertEqual(res2.total_reflinked, 0)  # Fallback a Hardlink
+            self.assertTrue(f4.exists())
+            self.assertEqual(f4.read_bytes(), b"Fallback Content 123456")
+
+        # 3. Simulación de rollback atómico cuando tanto Reflink como os.link fallan
+        f5 = sub_test_dir / "master_err.bin"
+        f6 = sub_test_dir / "dup_err.bin"
+        f5.write_bytes(b"Error rollback content")
+        f6.write_bytes(b"Error rollback content")
+        dups3, _ = scan_directory_for_duplicates(sub_test_dir)
+        plan3 = build_audit_plan(dups3)
+
+        with patch("datacleaner.quarantine.clone_file_cow", return_value=False), \
+             patch("os.link", side_effect=OSError("Simulated cross-device link error")):
+            res3 = deduplicate_with_hardlinks(plan3)
+            self.assertEqual(res3.total_linked, 0)
+            self.assertTrue(f6.exists(), "Rollback atómico debe restaurar el archivo redundante original")
+            self.assertEqual(f6.read_bytes(), b"Error rollback content")
+            self.assertTrue(any("No se pudo deduplicar" in e for e in res3.errors))
+
 
 
 if __name__ == "__main__":

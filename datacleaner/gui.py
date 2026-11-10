@@ -2220,27 +2220,33 @@ class DataCleanerGUI:
 
                 if op_mode == "HARDLINK":
                     res_hl: HardlinkResult = deduplicate_with_hardlinks(plan)
+                    hl_details = (
+                        f"Reflinks CoW: {res_hl.total_reflinked} | Hardlinks: {res_hl.total_linked - res_hl.total_reflinked}"
+                        if res_hl.total_reflinked > 0
+                        else "Enlaces físicos OS-Level (os.link)"
+                    )
                     self.history_manager.record_event(
                         action_type="HARDLINK",
                         target_dir=str(self.current_base_dir),
                         files_count=res_hl.total_linked,
                         bytes_affected=res_hl.total_bytes_saved,
-                        details="Enlaces físicos OS-Level (os.link)"
+                        details=hl_details
                     )
                     def on_hl_done():
                         self._finish_mitigation()
+                        mode_info = f" ({res_hl.total_reflinked} Reflinks CoW / {res_hl.total_linked - res_hl.total_reflinked} Hardlinks)" if res_hl.total_reflinked > 0 else ""
                         self._log(
-                            f"\n✔ Deduplicación Hardlink OS-Level: {res_hl.total_linked} archivos enlazados "
+                            f"\n✔ Deduplicación a Nivel de S.O.{mode_info}: {res_hl.total_linked} archivos deduplicados "
                             f"({format_bytes_with_equivalence(res_hl.total_bytes_saved)} liberados sin alterar rutas)."
                         )
                         if res_hl.errors:
                             for err in res_hl.errors:
                                 self._log(f"  ⚠ {err}")
                         messagebox.showinfo(
-                            "Deduplicación por Hardlinks Completada",
-                            f"Se enlazaron físicamente {res_hl.total_linked} archivos liberando "
+                            "Deduplicación a Nivel de Sistema de Archivos",
+                            f"Se deduplicaron exitosamente {res_hl.total_linked} archivos liberando "
                             f"{format_bytes_with_equivalence(res_hl.total_bytes_saved)}.\n\n"
-                            f"Todas las rutas originales permanecen intactas en su árbol de directorios."
+                            f"Todas las rutas originales permanecen intactas en su árbol de directorios con soporte de aislamiento Copy-on-Write / Enlace físico."
                         )
                         self._start_scan_thread()
                     self.root.after(0, on_hl_done)

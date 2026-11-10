@@ -19,6 +19,7 @@ import sys
 import logging
 import hashlib
 import hmac
+import ctypes
 
 try:
     import msvcrt
@@ -84,11 +85,16 @@ class DeleteResult:
 
 @dataclass
 class HardlinkResult:
-    """Resultado de la deduplicación transparente a nivel de sistema operativo mediante Hardlinks."""
+    """Resultado de la deduplicación transparente a nivel de sistema operativo mediante Reflinks (CoW) y Hardlinks."""
     total_linked: int
     total_bytes_saved: int
     linked_paths: list[str]
     errors: list[str]
+    total_reflinked: int = 0
+
+    @property
+    def total_deduplicated(self) -> int:
+        return self.total_linked
 
 
 def compute_manifest_signature(manifest_bytes: bytes, secret_key: bytes | None = None) -> str:
@@ -678,23 +684,189 @@ def execute_deletion_plan(
     return delete_redundant_files(all_redundant, use_trash=use_trash, expected_snapshots=all_snapshots)
 
 
+def reflink_file_windows(source_path: Path, target_path: Path) -> bool:
+    """
+    Intenta clonación de bloques Copy-on-Write a nivel de kernel en Windows
+    (ReFS / DevDrive / NTFS con soporte de block cloning mediante FSCTL_DUPLICATE_EXTENTS_TO_FILE).
+    """
+    if sys.platform != "win32":
+        return False
+
+    try:
+        source_size = source_path.stat().st_size
+    except OSError:
+        return False
+
+    if source_size == 0:
+        try:
+            target_path.unlink(missing_ok=True)
+            target_path.touch()
+            return True
+        except Exception:
+            return False
+
+    kernel32 = ctypes.windll.kernel32
+    GENERIC_READ = 0x80000000
+    GENERIC_WRITE = 0x40000000
+    FILE_SHARE_READ = 0x00000001
+    FILE_SHARE_WRITE = 0x00000002
+    OPEN_EXISTING = 3
+    CREATE_ALWAYS = 2
+    FILE_ATTRIBUTE_NORMAL = 0x00000080
+    FSCTL_DUPLICATE_EXTENTS_TO_FILE = 0x00098344
+    INVALID_HANDLE = ctypes.c_void_p(-1).value
+
+    h_target = kernel32.CreateFileW(
+        str(target_path),
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        None,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_NORMAL,
+        None
+    )
+    if h_target == INVALID_HANDLE or h_target == 0:
+        return False
+
+    h_source = kernel32.CreateFileW(
+        str(source_path),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        None,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        None
+    )
+    if h_source == INVALID_HANDLE or h_source == 0:
+        kernel32.CloseHandle(h_target)
+        target_path.unlink(missing_ok=True)
+        return False
+
+    class DUPLICATE_EXTENTS_DATA(ctypes.Structure):
+        _fields_ = [
+            ("FileHandle", ctypes.c_void_p),
+            ("SourceFileOffset", ctypes.c_int64),
+            ("TargetFileOffset", ctypes.c_int64),
+            ("ByteCount", ctypes.c_int64),
+        ]
+
+    try:
+        cluster_aligned_size = ((source_size + 4095) // 4096) * 4096
+
+        for count in (source_size, cluster_aligned_size):
+            dup_data = DUPLICATE_EXTENTS_DATA()
+            dup_data.FileHandle = h_source
+            dup_data.SourceFileOffset = 0
+            dup_data.TargetFileOffset = 0
+            dup_data.ByteCount = count
+
+            bytes_returned = ctypes.c_ulong(0)
+            success = kernel32.DeviceIoControl(
+                h_target,
+                FSCTL_DUPLICATE_EXTENTS_TO_FILE,
+                ctypes.byref(dup_data),
+                ctypes.sizeof(dup_data),
+                None,
+                0,
+                ctypes.byref(bytes_returned),
+                None
+            )
+            if success:
+                new_ptr = ctypes.c_int64(0)
+                kernel32.SetFilePointerEx(h_target, ctypes.c_int64(source_size), ctypes.byref(new_ptr), 0)
+                kernel32.SetEndOfFile(h_target)
+                return True
+        return False
+    except Exception:
+        return False
+    finally:
+        kernel32.CloseHandle(h_source)
+        kernel32.CloseHandle(h_target)
+
+
+def reflink_file_linux(source_path: Path, target_path: Path) -> bool:
+    """
+    Clonación de bloques Copy-on-Write en Linux (Btrfs, XFS, OCFS2) mediante ioctl FICLONE.
+    """
+    if not sys.platform.startswith("linux"):
+        return False
+
+    FICLONE = 0x40049409
+    try:
+        target_path.unlink(missing_ok=True)
+        with open(source_path, "rb") as src, open(target_path, "wb") as dst:
+            import fcntl
+            fcntl.ioctl(dst.fileno(), FICLONE, src.fileno())
+        return True
+    except Exception:
+        target_path.unlink(missing_ok=True)
+        return False
+
+
+def reflink_file_macos(source_path: Path, target_path: Path) -> bool:
+    """
+    Clonación de bloques Copy-on-Write en macOS (APFS) mediante llamada nativa clonefile().
+    """
+    if sys.platform != "darwin":
+        return False
+
+    try:
+        libc = ctypes.CDLL(None)
+        if not hasattr(libc, "clonefile"):
+            return False
+        target_path.unlink(missing_ok=True)
+        ret = libc.clonefile(
+            str(source_path).encode("utf-8"),
+            str(target_path).encode("utf-8"),
+            ctypes.c_int(0)
+        )
+        return ret == 0
+    except Exception:
+        target_path.unlink(missing_ok=True)
+        return False
+
+
+def clone_file_cow(source_path: Path, target_path: Path) -> bool:
+    """
+    Intenta clonar bloques Copy-on-Write (Reflink / Block Cloning) de forma transparente y multiplataforma:
+    - Windows: FSCTL_DUPLICATE_EXTENTS_TO_FILE (ReFS / DevDrive / NTFS moderno)
+    - Linux: ioctl FICLONE (Btrfs / XFS / OCFS2)
+    - macOS: clonefile() (APFS)
+
+    Retorna True si la clonación CoW fue exitosa.
+    Retorna False si el sistema de archivos no la soporta (desencadenando fallback a hardlink).
+    """
+    try:
+        if sys.platform == "win32":
+            return reflink_file_windows(source_path, target_path)
+        elif sys.platform.startswith("linux"):
+            return reflink_file_linux(source_path, target_path)
+        elif sys.platform == "darwin":
+            return reflink_file_macos(source_path, target_path)
+    except Exception as e:
+        logger.debug(f"Excepción en clone_file_cow: {e}")
+    return False
+
+
 def deduplicate_with_hardlinks(quarantine_plan: list[dict]) -> HardlinkResult:
     """
-    Deduplicación Transparente mediante Hardlinks (OS-Level: NTFS, ext4, APFS):
-    En lugar de mover el archivo a cuarentena o eliminar su ruta en el árbol del usuario,
-    reemplaza de forma atómica cada copia redundante por un enlace físico (`os.link(keep_file, redundant_file)`)
-    que apunta al mismo clúster de datos físicos en disco que el archivo maestro (`keep`).
-
-    Garantía Transaccional (Zero Data Loss):
-    1. Renombra temporalmente la copia redundante a un archivo `.dc_hl_bak` en su misma carpeta.
-    2. Crea el enlace físico `os.link(keep_path, redundant_path)`.
-    3. Si tiene éxito, elimina el respaldo temporal `.dc_hl_bak`.
-    4. Si falla (ej. volumen distinto o sistema de archivos sin soporte de hardlinks),
-       restaura de inmediato el respaldo temporal a su nombre original.
+    Deduplicación Transparente y Escalable a Nivel de Sistema de Archivos:
+    Pipeline Multi-Etapa (Reflink CoW con Fallback a Hardlink):
+    1. Intento Primario — Reflink / Copy-on-Write (CoW Block Cloning):
+       Utiliza APIs nativas del kernel (FSCTL_DUPLICATE_EXTENTS_TO_FILE en Windows ReFS/DevDrive,
+       FICLONE en Linux Btrfs/XFS, clonefile en macOS APFS) para crear un archivo independiente
+       que comparte los mismos bloques físicos en disco sin riesgo de sobreescritura accidental.
+    2. Fallback Secundario — Enlace Físico Tradicional (Hardlink / os.link):
+       Si el sistema de archivos no soporta clonación de bloques CoW (e.g. NTFS clásico, ext4, FAT32),
+       desciende de forma transparente a un hardlink físico mediante `os.link()`.
+    3. Garantía Transaccional y Anti-TOCTOU:
+       Verifica inmutabilidad de descriptores atómicos (_verify_file_unchanged) y preserva un respaldo
+       temporal (.dc_hl_bak) con rollback automático ante cualquier fallo.
     """
     linked_paths: list[str] = []
     errors: list[str] = []
     total_linked = 0
+    total_reflinked = 0
     total_bytes_saved = 0
 
     for group in quarantine_plan:
@@ -719,7 +891,7 @@ def deduplicate_with_hardlinks(quarantine_plan: list[dict]) -> HardlinkResult:
             if not _verify_file_unchanged(keep_path, exp_keep_size, exp_keep_mtime):
                 errors.append(
                     f"[TOCTOU] El archivo maestro KEEP '{keep_path}' fue modificado tras el escaneo. "
-                    "Deduplicación por hardlinks abortada para proteger datos nuevos."
+                    "Deduplicación abortada para proteger datos nuevos."
                 )
                 continue
 
@@ -744,7 +916,7 @@ def deduplicate_with_hardlinks(quarantine_plan: list[dict]) -> HardlinkResult:
                 if not _verify_file_unchanged(red_path, exp_size, exp_mtime):
                     errors.append(
                         f"[TOCTOU] El archivo '{red_path}' fue modificado tras el escaneo. "
-                        "Creación de hardlink abortada para proteger datos nuevos."
+                        "Deduplicación abortada para proteger datos nuevos."
                     )
                     continue
 
@@ -767,23 +939,39 @@ def deduplicate_with_hardlinks(quarantine_plan: list[dict]) -> HardlinkResult:
 
                 # Paso 1: Renombrado atómico a respaldo temporal
                 red_path.replace(backup_path)
-                try:
-                    # Paso 2: Crear Hardlink físico en la ruta original apuntando al inodo de keep_path
-                    os.link(str(keep_path), str(red_path))
-                except Exception as link_err:
-                    # Rollback atómico inmediato si os.link falla
-                    if backup_path.exists() and not red_path.exists():
-                        backup_path.replace(red_path)
-                    errors.append(f"No se pudo crear hardlink para '{red_path}': {link_err}")
-                    continue
+                dedup_success = False
+                used_reflink = False
 
-                # Paso 3: Eliminar el respaldo temporal una vez confirmado el hardlink
+                # Paso 2A: Intento 1 - Clonación de bloques Copy-on-Write (Reflink / Block Cloning)
+                try:
+                    if clone_file_cow(keep_path, red_path):
+                        dedup_success = True
+                        used_reflink = True
+                except Exception as cow_err:
+                    logger.debug(f"Reflink CoW no disponible para '{red_path}': {cow_err}")
+
+                # Paso 2B: Intento 2 (Fallback transparente) - Enlace físico tradicional (Hardlink os.link)
+                if not dedup_success:
+                    try:
+                        red_path.unlink(missing_ok=True)
+                        os.link(str(keep_path), str(red_path))
+                        dedup_success = True
+                    except Exception as link_err:
+                        # Rollback atómico inmediato si tanto Reflink como Hardlink fallan
+                        if backup_path.exists() and not red_path.exists():
+                            backup_path.replace(red_path)
+                        errors.append(f"No se pudo deduplicar (Reflink ni Hardlink) para '{red_path}': {link_err}")
+                        continue
+
+                # Paso 3: Eliminar el respaldo temporal una vez confirmado el reflink o hardlink
                 backup_path.unlink(missing_ok=True)
                 total_linked += 1
+                if used_reflink:
+                    total_reflinked += 1
                 total_bytes_saved += file_size
                 linked_paths.append(str(red_path))
             except Exception as e:
-                errors.append(f"Error procesando hardlink en '{red_path}': {e}")
+                errors.append(f"Error procesando deduplicación en '{red_path}': {e}")
 
     if linked_paths:
         try:
@@ -795,7 +983,8 @@ def deduplicate_with_hardlinks(quarantine_plan: list[dict]) -> HardlinkResult:
         total_linked=total_linked,
         total_bytes_saved=total_bytes_saved,
         linked_paths=linked_paths,
-        errors=errors
+        errors=errors,
+        total_reflinked=total_reflinked,
     )
 
 

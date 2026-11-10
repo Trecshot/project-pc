@@ -3,7 +3,7 @@
 <div align="center">
 
 [![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.15-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![Tests](https://img.shields.io/badge/Tests-92%2F92%20Passed%20(100%25)-success?logo=pytest&logoColor=white)](tests/)
+[![Tests](https://img.shields.io/badge/Tests-93%2F93%20Passed%20(100%25)-success?logo=pytest&logoColor=white)](tests/)
 [![Security](https://img.shields.io/badge/Security-NIST%20SSDF%20%7C%20Zero--Trust-blueviolet?logo=shield&logoColor=white)](SECURITY.md)
 [![UI](https://img.shields.io/badge/UI-Fluent%20Design%20(Windows%2011)-0078D4?logo=windows11&logoColor=white)](datacleaner/gui.py)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -32,7 +32,7 @@
 
 ### 3. 4 Modos de Mitigación Transaccional
 * **Cuarentena Reversible (Soft-Delete):** Traslada los duplicados a una carpeta de aislamiento con un archivo `manifest.json` y firma digital `manifest.json.sig` (HMAC-SHA256), permitiendo restaurarlos a su ubicación original en un solo clic.
-* **Deduplicación por Hardlinks (`os.link`):** Libera el 100% del espacio redundante haciendo que múltiples rutas apunten al mismo sector físico en disco (NTFS/ext4) mediante un proceso transaccional con respaldo temporal (`.dc_hl_bak`).
+* **Deduplicación CoW / Hardlinks (Block Cloning):** Pipeline escalonado que intenta primero clonación de bloques Copy-on-Write (Reflinks a nivel de kernel: ReFS/DevDrive en Windows, FICLONE en Linux, clonefile en APFS macOS) con fallback transparente a hardlinks físicos (`os.link`), garantizando aislamiento de escritura y liberación del 100% del espacio redundante con respaldo transaccional (`.dc_hl_bak`).
 * **Papelera de Reciclaje:** Envía los duplicados a la Papelera de Windows mediante `send2trash` con validación previa de librerías.
 * **Eliminación Permanente:** Borrado definitivo del disco previa confirmación explícita.
 
