@@ -32,6 +32,10 @@ datacleaner = "datacleaner.cli:main"
 where = ["."]
 include = ["datacleaner*"]
 
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
 [tool.ruff]
 line-length = 120
 target-version = "py310"
