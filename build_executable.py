@@ -156,8 +156,13 @@ def clean_workspace_artifacts(root_dir: Path | None = None) -> int:
     removed_count = 0
     import shutil
 
-    # Eliminar carpetas de caché
-    for cache_dir in list(root.rglob("__pycache__")) + list(root.glob(".pytest_cache")):
+    # Eliminar carpetas de caché y artefactos temporales/ocultos (Auditoría A / LOW-02)
+    dirs_to_clean = (
+        list(root.rglob("__pycache__"))
+        + list(root.glob(".pytest_cache"))
+        + list(root.glob(".tcl_bundle"))
+    )
+    for cache_dir in dirs_to_clean:
         if cache_dir.exists():
             try:
                 shutil.rmtree(cache_dir, ignore_errors=True)

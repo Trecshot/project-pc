@@ -33,7 +33,7 @@ except ImportError:
     HAS_FCNTL = False
 from dataclasses import dataclass, asdict
 from datacleaner.history import format_bytes_auto as _format_bytes, CleaningHistoryManager, get_utc_timestamp
-from datacleaner.security import _is_subpath
+from datacleaner.security import _is_subpath, is_blacklisted_path
 
 logger = logging.getLogger(__name__)
 
@@ -458,7 +458,11 @@ def restore_from_quarantine(manifest_path: Path | str, require_signature: bool =
     # Soporte para ambas claves ("files" y "items")
     files_data = manifest_data.get("files") or manifest_data.get("items") or []
     base_dir_str = manifest_data.get("base_dir")
-    base_dir_resolved = Path(base_dir_str).resolve().absolute() if base_dir_str else None
+    base_dir_resolved = (
+        Path(base_dir_str).resolve().absolute()
+        if base_dir_str and str(base_dir_str).strip()
+        else quarantine_dir.parent.resolve().absolute()
+    )
 
     total_restored = 0
     total_bytes_restored = 0
@@ -477,10 +481,17 @@ def restore_from_quarantine(manifest_path: Path | str, require_signature: bool =
         orig_path = Path(item["original_path"])
         orig_resolved = orig_path.resolve().absolute()
 
-        # Seguridad: Prevenir Path Traversal hacia rutas arbitrarias o fuera de base_dir (CRIT-03)
-        if base_dir_resolved and not _is_subpath(orig_resolved, base_dir_resolved):
+        # Seguridad: Prevenir Path Traversal hacia rutas arbitrarias o fuera de base_dir (CRIT-03 / HIGH-03)
+        if not _is_subpath(orig_resolved, base_dir_resolved):
             errors.append(
-                f"[SEGURIDAD] Intento de Path Traversal abortado: '{orig_path}' no es un subdirectorio de base_dir '{base_dir_str}'."
+                f"[SEGURIDAD] Intento de Path Traversal abortado: '{orig_path}' no es un subdirectorio de base_dir '{base_dir_resolved}'."
+            )
+            continue
+
+        # Validar contra SYSTEM_BLACKLIST para evitar restaurar en carpetas críticas del sistema (HIGH-03)
+        if is_blacklisted_path(orig_resolved):
+            errors.append(
+                f"[SEGURIDAD] Restauración abortada: '{orig_path}' pertenece a un directorio protegido del sistema."
             )
             continue
 

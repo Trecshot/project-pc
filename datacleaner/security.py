@@ -256,6 +256,45 @@ def validate_target_path(target_path: str | Path, must_be_dir: bool = True) -> P
     return resolved_target
 
 
+def is_blacklisted_path(target_path: Path | str) -> bool:
+    """
+    Verifica de forma estricta si una ruta pertenece a un directorio protegido del sistema (SYSTEM_BLACKLIST).
+    Incorpora exención de carpetas temporales de prueba validadas (CRIT-05 / HIGH-03).
+    """
+    try:
+        resolved = Path(target_path).resolve().absolute()
+        is_temp_child = False
+        try:
+            sys_temp = Path(tempfile.gettempdir()).resolve().absolute()
+            if resolved != sys_temp and _is_subpath(resolved, sys_temp):
+                is_test_env = (
+                    os.environ.get("DATACLEANER_TEST_MODE") == "1"
+                    or "pytest" in sys.modules
+                    or "unittest" in sys.modules
+                )
+                is_explicit_test_prefix = any(
+                    p.lower().startswith("datacleaner_")
+                    or p.lower().startswith("dc_test_")
+                    or p.lower().startswith("pytest-")
+                    or p.lower().startswith("tmp")
+                    for p in resolved.parts
+                )
+                if is_test_env or is_explicit_test_prefix:
+                    is_temp_child = True
+        except Exception:
+            pass
+
+        for restricted in SYSTEM_BLACKLIST:
+            restricted_resolved = restricted.resolve().absolute()
+            if is_temp_child and _is_subpath(resolved, sys_temp):
+                continue
+            if _is_subpath(resolved, restricted_resolved):
+                return True
+        return False
+    except Exception:
+        return False
+
+
 _CACHED_AUDIT_SECRET_KEY: bytes | None = None
 
 

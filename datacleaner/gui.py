@@ -1998,45 +1998,63 @@ class DataCleanerGUI:
         for idx, g in enumerate(report["groups"], start=1):
             short_hash = g["hash_sha256"][:8] + "…"
             f_size = g["file_size_formatted"]
-            mime_str = g.get("detected_mime", "application/octet-stream")
-            integ = g.get("integrity_status", "VERIFIED")
-            is_anom = g.get("is_anomaly", False)
+            member_sigs = g.get("member_signatures") or {}
 
-            if integ == "THREAT_EXECUTABLE_CAMOUFLAGED":
-                magic_badge = f"⛔ EJECUTABLE CAMUFLADO ({mime_str})"
-            elif is_anom:
-                magic_badge = f"⚠️ EXT. OFUSCADA ({mime_str})"
-            elif integ == "VERIFIED":
-                magic_badge = f"✔ {mime_str}"
-            else:
-                magic_badge = mime_str
+            # Helper forense para obtener metadatos individuales por archivo (MED-03)
+            def get_file_sig(file_p_str: str):
+                s = member_sigs.get(file_p_str) or member_sigs.get(str(Path(file_p_str).resolve()))
+                if s:
+                    m = s.get("detected_mime", "application/octet-stream")
+                    i = s.get("integrity_status", "VERIFIED")
+                    a = s.get("is_anomaly", False)
+                else:
+                    m = g.get("detected_mime", "application/octet-stream")
+                    i = g.get("integrity_status", "VERIFIED")
+                    a = g.get("is_anomaly", False)
+                return m, i, a
+
+            def make_badge(mime_str: str, integ: str, is_anom: bool) -> str:
+                if integ == "THREAT_EXECUTABLE_CAMOUFLAGED":
+                    return f"⛔ EJECUTABLE CAMUFLADO ({mime_str})"
+                elif is_anom:
+                    return f"⚠️ EXT. OFUSCADA ({mime_str})"
+                elif integ == "VERIFIED":
+                    return f"✔ {mime_str}"
+                else:
+                    return mime_str
+
+            kept_mime, kept_integ, kept_anom = get_file_sig(g["kept_file"])
+            kept_badge = make_badge(kept_mime, kept_integ, kept_anom)
 
             self.all_table_rows.append({
-                "values": (f"#{idx}", "✔ CONSERVAR (KEEP)", f_size, short_hash, magic_badge, g["kept_file"]),
-                "tag": "anomaly" if is_anom else "keep",
+                "values": (f"#{idx}", "✔ CONSERVAR (KEEP)", f_size, short_hash, kept_badge, g["kept_file"]),
+                "tag": "anomaly" if kept_anom else "keep",
                 "full_hash": g["hash_sha256"]
             })
             evaluated_db_records.append({
                 "file_path": g["kept_file"],
                 "file_size": g.get("file_size_bytes", 0),
                 "sha256_hash": g["hash_sha256"],
-                "detected_mime": mime_str,
-                "integrity_status": integ,
+                "detected_mime": kept_mime,
+                "integrity_status": kept_integ,
                 "action_taken": "KEEP"
             })
 
             for q_file in g["quarantine_files"]:
+                q_mime, q_integ, q_anom = get_file_sig(q_file)
+                q_badge = make_badge(q_mime, q_integ, q_anom)
+
                 self.all_table_rows.append({
-                    "values": (f"#{idx}", "📦 REDUNDANTE", f_size, short_hash, magic_badge, q_file),
-                    "tag": "anomaly" if is_anom else "quarantine",
+                    "values": (f"#{idx}", "📦 REDUNDANTE", f_size, short_hash, q_badge, q_file),
+                    "tag": "anomaly" if q_anom else "quarantine",
                     "full_hash": g["hash_sha256"]
                 })
                 evaluated_db_records.append({
                     "file_path": q_file,
                     "file_size": g.get("file_size_bytes", 0),
                     "sha256_hash": g["hash_sha256"],
-                    "detected_mime": mime_str,
-                    "integrity_status": integ,
+                    "detected_mime": q_mime,
+                    "integrity_status": q_integ,
                     "action_taken": "QUARANTINE"
                 })
 

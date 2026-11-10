@@ -55,13 +55,16 @@ def build_audit_plan(
             except OSError:
                 pass
 
-        # Evaluación de firmas binarias de todos los miembros del grupo (HIGH-01)
+        # Evaluación de firmas binarias de todos los miembros del grupo (HIGH-01 / MED-03)
         # Si un archivo redundante en cuarentena tiene extensión camuflada o es una amenaza, se eleva al grupo
         group_signatures = []
+        member_signatures = {}
         for p in paths:
             res_p = str(p.resolve())
             s = (file_signatures or {}).get(res_p) or analyze_file_signature(p)
             group_signatures.append(s)
+            member_signatures[res_p] = s.to_dict()
+            member_signatures[str(p)] = s.to_dict()
 
         # Jerarquía de severidad: amenazas críticas > extensiones manipuladas > verificado
         severity_rank = {
@@ -100,6 +103,7 @@ def build_audit_plan(
             "integrity_status": sig.integrity_status,
             "is_anomaly": sig.is_anomaly,
             "forensic_note": sig.forensic_note,
+            "member_signatures": member_signatures,
         })
     return plan
 
@@ -160,6 +164,7 @@ def generate_report_dict(
                 "integrity_status": g["integrity_status"],
                 "is_anomaly": g["is_anomaly"],
                 "forensic_note": g["forensic_note"],
+                "member_signatures": g.get("member_signatures", {}),
             }
             for g in plan
         ],
@@ -269,9 +274,10 @@ def _print_plain_report(report_data: dict[str, Any]):
     print()
 
 def export_report_json(report_data: dict[str, Any], output_path: Path | str) -> Path:
-    """Exporta el reporte a un archivo JSON formateado."""
+    """Exporta el reporte a un archivo JSON formateado excluyendo estructuras internas en memoria (REG-01)."""
     out_p = Path(output_path).resolve()
     out_p.parent.mkdir(parents=True, exist_ok=True)
+    serializable_data = {k: v for k, v in report_data.items() if k != "plan"}
     with open(out_p, "w", encoding="utf-8") as f:
-        json.dump(report_data, f, indent=2, ensure_ascii=False)
+        json.dump(serializable_data, f, indent=2, ensure_ascii=False, default=str)
     return out_p

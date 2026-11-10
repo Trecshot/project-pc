@@ -685,6 +685,156 @@ class TestAuditFindingsFixes(unittest.TestCase):
             # No debe haberse vuelto a llamar icacls para esa misma ruta
             self.assertEqual(mock_subproc.call_count, call_count)
 
+    def test_reg_01_export_report_json_serializes_cleanly(self):
+        """REG-01: export_report_json() serializa correctamente excluyendo 'plan' con objetos Path crudos."""
+        from datacleaner.reporter import generate_report_dict, export_report_json
+        import json
+
+        f1 = self.base_path / "doc1.txt"
+        f2 = self.base_path / "doc2.txt"
+        f1.write_bytes(b"Export JSON Test Payload")
+        f2.write_bytes(b"Export JSON Test Payload")
+
+        dups, summary = scan_directory_for_duplicates(self.base_path)
+        rep = generate_report_dict(self.base_path, dups, summary)
+        # Asegurar que 'plan' contiene objetos Path crudos en memoria
+        self.assertIn("plan", rep)
+        self.assertIsInstance(rep["plan"][0]["keep"], Path)
+
+        # export_report_json no debe fallar con TypeError y debe excluir 'plan'
+        out_json = self.base_path / "exported_report.json"
+        res_path = export_report_json(rep, out_json)
+        self.assertTrue(res_path.exists())
+
+        saved_data = json.loads(res_path.read_text(encoding="utf-8"))
+        self.assertNotIn("plan", saved_data)
+        self.assertIn("metadata", saved_data)
+        self.assertIn("groups", saved_data)
+        self.assertEqual(len(saved_data["groups"]), 1)
+
+    def test_high_03_anti_path_traversal_empty_base_dir_and_system_blacklist(self):
+        """HIGH-03: restore_from_quarantine() infiere base_dir cuando es vacío y bloquea rutas de SYSTEM_BLACKLIST."""
+        import json
+        from datacleaner.quarantine import restore_from_quarantine, sign_manifest_file
+
+        q_dir = self.base_path / "quarantine_evasion"
+        q_dir.mkdir()
+
+        # 1. Manifiesto con base_dir vacío y archivo que intenta escapar fuera de quarantine.parent
+        manifest_data = {
+            "session_id": "test_evasion",
+            "timestamp": "2026-11-09 00:00:00",
+            "base_dir": "",  # base_dir vacío malicioso
+            "quarantine_dir": str(q_dir),
+            "total_files": 1,
+            "total_bytes": 10,
+            "files": [
+                {
+                    "original_path": str(self.base_path.parent / "escape_evil.txt"),
+                    "quarantine_path": str(q_dir / "q1.bin"),
+                    "relative_path": "../escape_evil.txt",
+                    "hash_sha256": "fake",
+                    "size_bytes": 10,
+                    "mtime": 1000.0,
+                    "restored": False,
+                }
+            ],
+            "items": [],
+        }
+        (q_dir / "q1.bin").write_bytes(b"traversal1")
+        manifest_file = q_dir / "manifest.json"
+        manifest_file.write_text(json.dumps(manifest_data), encoding="utf-8")
+        sign_manifest_file(manifest_file)
+
+        res = restore_from_quarantine(manifest_file)
+        self.assertEqual(res.total_restored, 0)
+        self.assertTrue(any("Path Traversal" in err for err in res.errors))
+
+        # 2. Manifiesto que intenta restaurar en una ruta protegida del sistema (SYSTEM_BLACKLIST)
+        import os
+        sys_drive = os.environ.get("SystemDrive", "C:")
+        blacklist_target = Path(f"{sys_drive}/Windows/System32/evil_payload.dll")
+
+        q_dir2 = self.base_path / "quarantine_blacklist"
+        q_dir2.mkdir()
+        manifest_data2 = {
+            "session_id": "test_blacklist",
+            "timestamp": "2026-11-09 00:00:00",
+            "base_dir": str(self.base_path),
+            "quarantine_dir": str(q_dir2),
+            "total_files": 1,
+            "total_bytes": 10,
+            "files": [
+                {
+                    "original_path": str(blacklist_target),
+                    "quarantine_path": str(q_dir2 / "q2.bin"),
+                    "relative_path": "evil.dll",
+                    "hash_sha256": "fake",
+                    "size_bytes": 10,
+                    "mtime": 1000.0,
+                    "restored": False,
+                }
+            ],
+            "items": [],
+        }
+        (q_dir2 / "q2.bin").write_bytes(b"traversal2")
+        manifest_file2 = q_dir2 / "manifest.json"
+        manifest_file2.write_text(json.dumps(manifest_data2), encoding="utf-8")
+        sign_manifest_file(manifest_file2)
+
+        res2 = restore_from_quarantine(manifest_file2)
+        self.assertEqual(res2.total_restored, 0)
+        self.assertTrue(any("directorio protegido del sistema" in err or "Path Traversal" in err for err in res2.errors))
+
+    def test_med_03_member_signatures_individual_integrity(self):
+        """MED-03: Cada miembro del grupo conserva su propia firma individual en member_signatures."""
+        from datacleaner.reporter import build_audit_plan, generate_report_dict
+
+        # Archivo legítimo .exe con cabecera PE MZ
+        f_exe = self.base_path / "app.exe"
+        # Archivo camuflado .pdf con la misma cabecera PE MZ
+        f_pdf = self.base_path / "factura.pdf"
+        exe_payload = b"MZ" + b"\x90" * 128
+        f_exe.write_bytes(exe_payload)
+        f_pdf.write_bytes(exe_payload)
+
+        dups, summary = scan_directory_for_duplicates(self.base_path)
+        plan = build_audit_plan(dups)
+        self.assertEqual(len(plan), 1)
+
+        # El grupo eleva la alerta máxima
+        self.assertEqual(plan[0]["integrity_status"], "THREAT_EXECUTABLE_CAMOUFLAGED")
+
+        # Pero cada miembro conserva su estado individual exacto
+        member_sigs = plan[0]["member_signatures"]
+        exe_sig = member_sigs[str(f_exe.resolve())]
+        pdf_sig = member_sigs[str(f_pdf.resolve())]
+
+        self.assertEqual(exe_sig["integrity_status"], "VERIFIED")
+        self.assertEqual(pdf_sig["integrity_status"], "THREAT_EXECUTABLE_CAMOUFLAGED")
+
+        # Verificar en generate_report_dict
+        rep = generate_report_dict(self.base_path, dups, summary)
+        group_rep = rep["groups"][0]
+        self.assertIn("member_signatures", group_rep)
+        self.assertEqual(group_rep["member_signatures"][str(f_exe.resolve())]["integrity_status"], "VERIFIED")
+        self.assertEqual(group_rep["member_signatures"][str(f_pdf.resolve())]["integrity_status"], "THREAT_EXECUTABLE_CAMOUFLAGED")
+
+    def test_low_02_clean_workspace_artifacts_tcl_bundle(self):
+        """LOW-02: clean_workspace_artifacts() purga .tcl_bundle y cachés del árbol de trabajo."""
+        from build_executable import clean_workspace_artifacts
+
+        test_root = self.base_path / "build_clean_test"
+        test_root.mkdir()
+        bundle_dir = test_root / ".tcl_bundle"
+        bundle_dir.mkdir()
+        (bundle_dir / "sample.tcl").write_text("set foo bar", encoding="utf-8")
+
+        self.assertTrue(bundle_dir.exists())
+        removed = clean_workspace_artifacts(test_root)
+        self.assertGreaterEqual(removed, 1)
+        self.assertFalse(bundle_dir.exists())
+
 
 
 if __name__ == "__main__":
