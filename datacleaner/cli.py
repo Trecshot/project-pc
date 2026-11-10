@@ -95,7 +95,7 @@ def cmd_scan(args: argparse.Namespace):
     # Si hay duplicados y el usuario especificó --quarantine-interactive, ofrecer moverlos
     if report_data["metadata"]["total_redundant_files"] > 0 and args.interactive:
         if Confirm.ask("\n[bold yellow]¿Desea mover los archivos redundantes a cuarentena ahora?[/bold yellow]"):
-            _execute_quarantine(target_dir, duplicates, args.keep_rule)
+            _execute_quarantine(target_dir, duplicates, args.keep_rule, summary=summary, plan=report_data.get("plan"))
 
 def cmd_quarantine(args: argparse.Namespace):
     """Ejecuta el aislamiento en cuarentena (Soft-Delete) con confirmación explícita."""
@@ -142,7 +142,13 @@ def cmd_quarantine(args: argparse.Namespace):
                 console.print("[dim]Operación cancelada por el usuario.[/dim]")
                 return
 
-        plan = build_audit_plan(duplicates, keep_rule=args.keep_rule, base_dir=target_dir)
+        # Reutilizar el plan precalculado con firmas y snapshots para evitar doble cómputo
+        plan = report_data.get("plan") or build_audit_plan(
+            duplicates,
+            keep_rule=args.keep_rule,
+            base_dir=target_dir,
+            file_signatures=getattr(summary, "file_signatures", None)
+        )
         del_res = execute_deletion_plan(plan, use_trash=use_trash)
         if del_res.total_deleted > 0:
             try:
@@ -175,23 +181,32 @@ def cmd_quarantine(args: argparse.Namespace):
             console.print("[dim]Operación cancelada por el usuario. No se modificó ningún archivo.[/dim]")
             return
 
-    _execute_quarantine(target_dir, duplicates, args.keep_rule, custom_dir=args.quarantine_dir, summary=summary)
+    _execute_quarantine(
+        target_dir,
+        duplicates,
+        args.keep_rule,
+        custom_dir=args.quarantine_dir,
+        summary=summary,
+        plan=report_data.get("plan")
+    )
 
 def _execute_quarantine(
     base_dir: Path,
     duplicates: dict,
     keep_rule: str,
     custom_dir: str | None = None,
-    summary=None
+    summary=None,
+    plan: list[dict] | None = None
 ):
     """Función auxiliar para trasladar a cuarentena y presentar resultado."""
     custom_p = Path(custom_dir) if custom_dir else None
-    plan = build_audit_plan(
-        duplicates,
-        keep_rule=keep_rule,
-        base_dir=base_dir,
-        file_signatures=getattr(summary, "file_signatures", None)
-    )
+    if plan is None:
+        plan = build_audit_plan(
+            duplicates,
+            keep_rule=keep_rule,
+            base_dir=base_dir,
+            file_signatures=getattr(summary, "file_signatures", None)
+        )
 
     with console.status("[yellow]Trasladando archivos redundantes a directorio de Cuarentena...[/yellow]"):
         result = quarantine_redundant_files(base_dir, plan, custom_quarantine_dir=custom_p)
