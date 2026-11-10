@@ -8,6 +8,7 @@ mediante una experiencia enriquecida con Rich (colores, tablas, barras de progre
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 from rich.console import Console
@@ -56,14 +57,20 @@ def cmd_scan(args: argparse.Namespace):
     ) as progress:
         task_id = progress.add_task("[cyan]Analizando archivos por tamaño y hash SHA-256...", total=100)
 
+        last_cli_update = 0.0
+
         def on_progress(done: int, total: int, filename: str):
-            if total > 0:
-                percent = int((done / total) * 100)
-                progress.update(
-                    task_id,
-                    completed=percent,
-                    description=f"[cyan]Calculando SHA-256 ({done}/{total}): [dim]{filename[:30]}[/dim]"
-                )
+            nonlocal last_cli_update
+            now = time.monotonic()
+            if done == total or (now - last_cli_update) >= 0.05:
+                last_cli_update = now
+                if total > 0:
+                    percent = int((done / total) * 100)
+                    progress.update(
+                        task_id,
+                        completed=percent,
+                        description=f"[cyan]Calculando SHA-256 ({done}/{total}): [dim]{filename[:30]}[/dim]"
+                    )
 
         duplicates, summary = scan_directory_for_duplicates(
             base_dir=target_dir,

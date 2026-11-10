@@ -55,8 +55,32 @@ def build_audit_plan(
             except OSError:
                 pass
 
-        resolved_kept = str(kept_file.resolve())
-        sig = (file_signatures or {}).get(resolved_kept) or analyze_file_signature(kept_file)
+        # Evaluación de firmas binarias de todos los miembros del grupo (HIGH-01)
+        # Si un archivo redundante en cuarentena tiene extensión camuflada o es una amenaza, se eleva al grupo
+        group_signatures = []
+        for p in paths:
+            res_p = str(p.resolve())
+            s = (file_signatures or {}).get(res_p) or analyze_file_signature(p)
+            group_signatures.append(s)
+
+        # Jerarquía de severidad: amenazas críticas > extensiones manipuladas > verificado
+        severity_rank = {
+            "THREAT_EXECUTABLE_CAMOUFLAGED": 4,
+            "THREAT_DOUBLE_EXTENSION": 3,
+            "SUSPICIOUS_ARCHIVE_WRAPPER": 3,
+            "EXTENSION_MISMATCH": 2,
+            "GENERIC_BINARY": 1,
+            "VERIFIED": 0,
+            "UNKNOWN": 0,
+            "EMPTY_OR_UNREADABLE": 0,
+        }
+        sig = group_signatures[0]
+        max_rank = -1
+        for s in group_signatures:
+            rank = severity_rank.get(s.integrity_status, 1 if s.is_anomaly else 0)
+            if rank > max_rank:
+                max_rank = rank
+                sig = s
 
         plan.append({
             "hash": sha,
@@ -138,7 +162,8 @@ def generate_report_dict(
                 "forensic_note": g["forensic_note"],
             }
             for g in plan
-        ]
+        ],
+        "plan": plan
     }
 
 def print_rich_report(report_data: dict[str, Any], console=None):

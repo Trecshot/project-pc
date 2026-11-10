@@ -17,6 +17,8 @@ Incluye:
 import os
 import sys
 import json
+import time
+from datetime import datetime, timezone
 import subprocess
 import threading
 import ctypes
@@ -1906,9 +1908,16 @@ class DataCleanerGUI:
         self._log(f"Criterio: {keep_rule} | Hilos de trabajo: {workers}")
 
         def worker():
+            last_progress_time = 0.0
+
             def progress_cb(done, total, fname):
-                pct = int((done / total) * 100) if total > 0 else 0
-                self.root.after(0, lambda: self._update_progress(pct, f"Calculando SHA-256 ({done}/{total}): {fname}"))
+                nonlocal last_progress_time
+                now = time.monotonic()
+                # Throttling de actualización a la UI (máx 1 cada 50ms o al finalizar) (MED-02)
+                if done == total or (now - last_progress_time) >= 0.05:
+                    last_progress_time = now
+                    pct = int((done / total) * 100) if total > 0 else 0
+                    self.root.after(0, lambda d=done, t=total, fn=fname, p=pct: self._update_progress(p, f"Calculando SHA-256 ({d}/{t}): {fn}"))
 
             duplicates, summary = scan_directory_for_duplicates(
                 base_dir=target_dir,
@@ -1950,6 +1959,8 @@ class DataCleanerGUI:
         self.last_duplicates = duplicates
         self.last_summary = summary
         self.last_report = report
+        self.last_plan = report.get("plan")
+        self.last_plan_rule = report.get("metadata", {}).get("keep_rule_applied")
         self._refresh_quarantine_badge()
 
         meta = report["metadata"]
@@ -2031,8 +2042,7 @@ class DataCleanerGUI:
 
         # Persistir auditoría en SQLite transaccional (tablas sesiones_cuarentena y archivos_evaluados)
         try:
-            from datetime import datetime
-            scan_session_id = f"scan_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            scan_session_id = f"scan_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
             self.history_manager.record_audit_session(
                 session_id=scan_session_id,
                 base_dir=meta.get("base_directory", str(self.current_base_dir or "")),
@@ -2112,14 +2122,8 @@ class DataCleanerGUI:
         rec_str = self.last_report["metadata"]["recoverable_formatted"]
         rule_key = self.rule_combobox.get()
         keep_rule = RULE_OPTIONS.get(rule_key, KeepRule.DEEPEST_THEN_NEWEST.value)
-        plan = build_audit_plan(
-            self.last_duplicates,
-            keep_rule=keep_rule,
-            base_dir=self.current_base_dir,
-            file_signatures=getattr(self.last_summary, "file_signatures", None)
-        )
 
-        # 1. Determinar modo de mitigación y solicitar confirmación en el Main Thread
+        # 1. Determinar modo de mitigación y solicitar confirmación en el Main Thread sin bloquear con I/O (MED-02)
         op_mode = None
         if getattr(self, "hardlink_mode_var", None) and self.hardlink_mode_var.get():
             resp = messagebox.askyesno(
@@ -2186,6 +2190,16 @@ class DataCleanerGUI:
         # 3. Función auxiliar para ejecutar el I/O en hilo secundario (Non-blocking GUI)
         def _bg_worker():
             try:
+                # Reutilizar plan previamente construido o calcularlo en este hilo de trabajo (MED-02)
+                plan = getattr(self, "last_plan", None)
+                if plan is None or getattr(self, "last_plan_rule", None) != keep_rule:
+                    plan = build_audit_plan(
+                        self.last_duplicates,
+                        keep_rule=keep_rule,
+                        base_dir=self.current_base_dir,
+                        file_signatures=getattr(self.last_summary, "file_signatures", None)
+                    )
+
                 if op_mode == "HARDLINK":
                     res_hl: HardlinkResult = deduplicate_with_hardlinks(plan)
                     self.history_manager.record_event(

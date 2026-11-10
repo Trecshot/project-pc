@@ -122,15 +122,34 @@ def read_magic_header(file_path: Path, num_bytes: int = 16) -> bytes | None:
         return None
 
 
+MAX_ZIP_ENTRIES = 10_000
+
+
 def inspect_ooxml_container(file_path: Path, ext: str, header_hex: str) -> FileSignatureReport | None:
     """
     Inspecciona en memoria la estructura interna de un archivo OOXML (.docx, .xlsx, .pptx)
-    sin descomprimirlo a disco. Verifica la presencia de '[Content_Types].xml' o carpetas '_rels'.
+    sin descomprimirlo a disco. Limita el análisis a MAX_ZIP_ENTRIES para neutralizar ataques Zip Bomb (HIGH-02).
     Detecta contenedores maliciosos que encapsulan ejecutables/scripts (SUSPICIOUS_ARCHIVE_WRAPPER).
     """
     try:
         with zipfile.ZipFile(file_path, "r") as zf:
-            namelist = [n.lower() for n in zf.namelist()]
+            infolist = zf.infolist()
+            if len(infolist) > MAX_ZIP_ENTRIES:
+                return FileSignatureReport(
+                    file_path=str(file_path),
+                    declared_extension=ext,
+                    header_hex=header_hex,
+                    detected_mime="application/zip",
+                    detected_format="Contenedor ZIP Anómalo (Zip Bomb / Exceso de Entradas)",
+                    integrity_status="SUSPICIOUS_ARCHIVE_WRAPPER",
+                    is_anomaly=True,
+                    forensic_note=(
+                        f"ALERTA FORENSE CRÍTICA: Archivo ZIP contiene {len(infolist):,} entradas "
+                        f"(límite seguro={MAX_ZIP_ENTRIES:,}). Bloqueado por riesgo de Denegación de Servicio (Zip Bomb)."
+                    )
+                )
+
+            namelist = [info.filename.lower() for info in infolist[:MAX_ZIP_ENTRIES]]
             has_content_types = "[content_types].xml" in namelist
             has_rels = any(n.startswith("_rels/") or "/_rels/" in n for n in namelist)
 
@@ -148,7 +167,7 @@ def inspect_ooxml_container(file_path: Path, ext: str, header_hex: str) -> FileS
 
             # Verificar si encapsula ejecutables o scripts maliciosos
             DANGEROUS_EXTS = {".exe", ".dll", ".bat", ".cmd", ".ps1", ".vbs", ".sh", ".py", ".elf", ".scr", ".com"}
-            contained_execs = [n for n in zf.namelist() if Path(n).suffix.lower() in DANGEROUS_EXTS]
+            contained_execs = [n for n in namelist if Path(n).suffix.lower() in DANGEROUS_EXTS]
             if contained_execs:
                 return FileSignatureReport(
                     file_path=str(file_path),
@@ -215,13 +234,13 @@ def analyze_file_signature(file_path: Path) -> FileSignatureReport:
             ),
         )
 
-    header = read_magic_header(file_path, 16)
+    extended_header = read_magic_header(file_path, 256)
 
-    if header is None or len(header) == 0:
+    if extended_header is None or len(extended_header) == 0:
         return FileSignatureReport(
             file_path=str(file_path),
             declared_extension=ext or "(sin ext)",
-            header_hex="" if header is None else "EMPTY",
+            header_hex="" if extended_header is None else "EMPTY",
             detected_mime="application/x-empty",
             detected_format="Archivo vacío o inaccesible",
             integrity_status="EMPTY_OR_UNREADABLE",
@@ -229,18 +248,27 @@ def analyze_file_signature(file_path: Path) -> FileSignatureReport:
             forensic_note="Sin bytes de cabecera para evaluar."
         )
 
+    header = extended_header[:16]
     header_hex = " ".join(f"{b:02X}" for b in header[:8])
 
-    # Detección de Scripts HTML / HTA activos camuflados como documentos o imágenes (CWE-434 / OWASP)
+    # Detección de Scripts HTML / HTA activos camuflados como documentos o imágenes (CWE-434 / OWASP / HIGH-02)
     if ext in DOCUMENT_OR_MEDIA_EXTENSIONS and ext not in {".html", ".htm", ".xhtml", ".svg"}:
-        header_lower = header.lower()
+        # Limpieza de BOM UTF-8, espacios en blanco y comentarios preliminares (<!-- -->)
+        cleaned = extended_header.lstrip(b"\xef\xbb\xbf \t\r\n")
+        while cleaned.startswith(b"<!--"):
+            end_comment = cleaned.find(b"-->")
+            if end_comment != -1:
+                cleaned = cleaned[end_comment + 3:].lstrip(b" \t\r\n")
+            else:
+                break
+        cleaned_lower = cleaned.lower()
         if (
-            header_lower.startswith(b"<script")
-            or header_lower.startswith(b"<hta:")
-            or header_lower.startswith(b"<!doctype html")
-            or header_lower.startswith(b"<html")
-            or b"<hta:application" in header_lower
-            or b"<script" in header_lower
+            cleaned_lower.startswith(b"<script")
+            or cleaned_lower.startswith(b"<hta:")
+            or cleaned_lower.startswith(b"<!doctype html")
+            or cleaned_lower.startswith(b"<html")
+            or b"<hta:application" in cleaned_lower[:128]
+            or b"<script" in cleaned_lower[:128]
         ):
             return FileSignatureReport(
                 file_path=str(file_path),

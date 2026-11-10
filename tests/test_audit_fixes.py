@@ -533,6 +533,158 @@ class TestAuditFindingsFixes(unittest.TestCase):
             self.assertEqual(summary.already_hardlinked_skipped, 0)
             self.assertEqual(len(dups), 1)
 
+    def test_crit_02_tamper_evident_no_silent_reseal(self):
+        """CRIT-02: Modificar un registro en la base de datos es detectado como adulteración y _init_database no lo resella silenciosamente."""
+        import sqlite3
+        db_path = self.base_path / "test_tamper.sqlite"
+        mgr = CleaningHistoryManager(history_file=db_path)
+        mgr.record_event("QUARANTINE", "C:/test1.txt", 1, 100, "details 1")
+        mgr.record_event("QUARANTINE", "C:/test2.txt", 1, 200, "details 2")
+
+        # Verificar que inicialmente es íntegro
+        valid, errors = mgr.verify_audit_chain_integrity()
+        self.assertTrue(valid)
+        self.assertEqual(len(errors), 0)
+
+        # Adulterar un campo protegido por el HMAC en SQLite directamente
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("UPDATE operations_history SET bytes_count = 999999 WHERE rowid = 1")
+            conn.commit()
+
+        # Al reinstanciar el manager (_init_database()), NO debe auto-resellar registros ya hasheados
+        mgr2 = CleaningHistoryManager(history_file=db_path)
+        valid2, errors2 = mgr2.verify_audit_chain_integrity()
+        self.assertFalse(valid2, "La cadena debe ser detectada como adulterada (Tamper-Evident)")
+        self.assertTrue(any("ADULTERACIÓN DETECTADA" in err for err in errors2))
+
+    def test_crit_03_require_signature_and_path_traversal(self):
+        """CRIT-03: verify_manifest_signature exige .sig por defecto; restore_from_quarantine bloquea path traversal."""
+        import json
+        from datacleaner.quarantine import (
+            quarantine_redundant_files,
+            restore_from_quarantine,
+            verify_manifest_signature,
+            sign_manifest_file,
+        )
+        f1 = self.base_path / "orig.txt"
+        f2 = self.base_path / "dup.txt"
+        f1.write_bytes(b"Safe restore payload")
+        f2.write_bytes(b"Safe restore payload")
+
+        dups, _ = scan_directory_for_duplicates(self.base_path)
+        plan = build_audit_plan(dups)
+        q_res = quarantine_redundant_files(self.base_path, plan)
+        q_dir = Path(q_res.quarantine_dir)
+        manifest_path = q_dir / "manifest.json"
+
+        sig_file = q_dir / "manifest.json.sig"
+        self.assertTrue(sig_file.exists())
+
+        # Eliminar el archivo .sig para simular un ataque de bypass
+        sig_file.unlink()
+
+        # Debe fallar con ValueError al requerir firma
+        with self.assertRaises(ValueError) as ctx:
+            verify_manifest_signature(manifest_path, require_signature=True)
+        self.assertIn("INTEGRIDAD COMPROMETIDA", str(ctx.exception))
+
+        with self.assertRaises(ValueError) as ctx:
+            restore_from_quarantine(manifest_path, require_signature=True)
+        self.assertIn("INTEGRIDAD COMPROMETIDA", str(ctx.exception))
+
+        # Recrear una cuarentena válida para probar path traversal
+        q_dir2 = self.base_path / "quarantine_traversal"
+        q_dir2.mkdir()
+        manifest_data = {
+            "session_id": "test_traversal",
+            "timestamp": "2026-11-09 00:00:00",
+            "base_dir": str(self.base_path),
+            "quarantine_dir": str(q_dir2),
+            "total_files": 1,
+            "total_bytes": 9,
+            "files": [
+                {
+                    "original_path": str(self.base_path.parent / "evil.txt"),
+                    "quarantine_path": str(q_dir2 / "danger.bin"),
+                    "relative_path": "../evil.txt",
+                    "hash_sha256": "fake",
+                    "size_bytes": 9,
+                    "mtime": 1000.0,
+                    "restored": False,
+                }
+            ],
+            "items": [],
+        }
+        (q_dir2 / "danger.bin").write_bytes(b"malicious")
+        manifest_file2 = q_dir2 / "manifest.json"
+        manifest_file2.write_text(json.dumps(manifest_data), encoding="utf-8")
+        sign_manifest_file(manifest_file2)
+
+        res = restore_from_quarantine(manifest_file2)
+        self.assertEqual(res.total_restored, 0)
+        self.assertTrue(any("Path Traversal" in err for err in res.errors))
+
+    def test_high_01_forensic_threat_elevation_in_group(self):
+        """HIGH-01: Si un archivo del grupo es un ejecutable camuflado, el grupo entero eleva su integridad."""
+        f_clean = self.base_path / "safe.jpg"
+        f_fake = self.base_path / "disguised.jpg"
+        # Cabecera PE MZ de ejecutable camuflado como .jpg
+        exe_payload = b"MZ" + b"\x90" * 100
+        f_clean.write_bytes(exe_payload)
+        f_fake.write_bytes(exe_payload)
+
+        dups, _ = scan_directory_for_duplicates(self.base_path)
+        plan = build_audit_plan(dups)
+        self.assertEqual(len(plan), 1)
+        self.assertEqual(plan[0]["integrity_status"], "THREAT_EXECUTABLE_CAMOUFLAGED")
+
+    def test_high_02_zip_bomb_limit_and_html_evasion(self):
+        """HIGH-02: Detección de Zip Bomb DoS (>10k entradas) y análisis HTML camuflado tras comentarios."""
+        import zipfile
+        import io
+        from datacleaner.magic import inspect_ooxml_container, analyze_file_signature
+
+        # 1. Zip Bomb con > 10,000 entradas
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_STORED) as zf:
+            for i in range(10_005):
+                zf.writestr(f"file_{i}.txt", b"a")
+
+        zip_bomb_file = self.base_path / "bomb.docx"
+        zip_bomb_file.write_bytes(buf.getvalue())
+        rep = inspect_ooxml_container(zip_bomb_file, ".docx", "50 4B 03 04")
+        self.assertIsNotNone(rep)
+        self.assertEqual(rep.integrity_status, "SUSPICIOUS_ARCHIVE_WRAPPER")
+        self.assertIn("Zip Bomb", rep.forensic_note)
+
+        # 2. HTML script camuflado tras comentarios o espacios
+        html_payload = b"  \n<!-- Comment header -->\n<HTML><SCRIPT>alert(1)</SCRIPT></HTML>"
+        html_file = self.base_path / "script_camouflaged.jpg"
+        html_file.write_bytes(html_payload)
+        sig = analyze_file_signature(html_file)
+        self.assertEqual(sig.integrity_status, "THREAT_EXECUTABLE_CAMOUFLAGED")
+
+    def test_med_01_harden_permissions_caching(self):
+        """MED-01: _HARDENED_PATHS evita invocar icacls repetidamente en cada conexión SQLite."""
+        from unittest.mock import patch
+        from datacleaner.history import CleaningHistoryManager, _HARDENED_PATHS
+
+        db_path = self.base_path / "cached_icacls.sqlite"
+        _HARDENED_PATHS.discard(str(db_path.resolve()))
+
+        with patch("subprocess.run") as mock_subproc:
+            # Primera instanciación: debe invocar icacls (si está en Windows)
+            mgr1 = CleaningHistoryManager(history_file=db_path)
+            call_count = mock_subproc.call_count
+
+            # Siguientes instanciaciones y operaciones sobre la misma ruta
+            mgr2 = CleaningHistoryManager(history_file=db_path)
+            mgr2.load_entries()
+            mgr2.get_summary()
+
+            # No debe haberse vuelto a llamar icacls para esa misma ruta
+            self.assertEqual(mock_subproc.call_count, call_count)
+
 
 
 if __name__ == "__main__":

@@ -10,7 +10,8 @@ Cumple con RF-06 y las especificaciones de flujo de restauración interactivo.
 """
 
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import Any
 import json
 import shutil
 import os
@@ -31,7 +32,8 @@ try:
 except ImportError:
     HAS_FCNTL = False
 from dataclasses import dataclass, asdict
-from datacleaner.history import format_bytes_auto as _format_bytes, CleaningHistoryManager
+from datacleaner.history import format_bytes_auto as _format_bytes, CleaningHistoryManager, get_utc_timestamp
+from datacleaner.security import _is_subpath
 
 logger = logging.getLogger(__name__)
 
@@ -109,14 +111,22 @@ def sign_manifest_file(manifest_path: Path, secret_key: bytes | None = None) -> 
     return sig_path
 
 
-def verify_manifest_signature(manifest_path: Path, secret_key: bytes | None = None) -> bool:
+def verify_manifest_signature(
+    manifest_path: Path,
+    secret_key: bytes | None = None,
+    require_signature: bool = True
+) -> bool:
     """
-    Verifica que el archivo manifest.json coincida de forma idéntica con manifest.json.sig.
-    Retorna True si la firma es válida. Lanza ValueError si la firma no coincide (adulteración).
-    Si el archivo .sig no existe (compatibilidad hacia atrás), retorna True.
+    Verifica que el archivo manifest.json coincida de forma idéntica con manifest.json.sig (CRIT-03).
+    Retorna True si la firma es válida. Lanza ValueError si la firma no coincide o falta cuando require_signature es True.
     """
     sig_path = manifest_path.with_name(manifest_path.name + ".sig")
     if not sig_path.exists():
+        if require_signature:
+            raise ValueError(
+                f"[INTEGRIDAD COMPROMETIDA] Falta el archivo de firma digital obligatorio '{sig_path.name}'. "
+                "La restauración ha sido abortada por seguridad."
+            )
         return True
     expected_sig = sig_path.read_text(encoding="utf-8").strip()
     manifest_bytes = manifest_path.read_bytes()
@@ -206,9 +216,9 @@ def create_quarantine_directory(base_dir: Path, custom_parent: Path | None = Non
     Retorna (quarantine_dir, session_id, timestamp_iso).
     Ejemplo: ./_quarantine_20261104_163151/
     """
-    now = datetime.now()
-    timestamp_str = now.strftime("%Y%m%d_%H%M%S")
-    timestamp_iso = now.strftime("%Y-%m-%dT%H:%M:%S")
+    now_utc = datetime.now(timezone.utc)
+    timestamp_str = now_utc.strftime("%Y%m%d_%H%M%S")
+    timestamp_iso = get_utc_timestamp()
     session_id = f"quarantine_{timestamp_str}"
     folder_name = f"_{session_id}"
 
@@ -238,7 +248,7 @@ def quarantine_redundant_files(
         quarantine_dir = Path(custom_quarantine_dir).resolve().absolute()
         quarantine_dir.mkdir(parents=True, exist_ok=True)
         session_id = quarantine_dir.name.lstrip("_")
-        timestamp_iso = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+        timestamp_iso = get_utc_timestamp()
     else:
         quarantine_dir, session_id, timestamp_iso = create_quarantine_directory(base_dir)
 
@@ -420,7 +430,7 @@ def find_quarantine_sessions(base_dir: Path | str) -> list[dict]:
     sessions.sort(key=lambda s: s["folder_name"], reverse=True)
     return sessions
 
-def restore_from_quarantine(manifest_path: Path | str) -> RestoreResult:
+def restore_from_quarantine(manifest_path: Path | str, require_signature: bool = True) -> RestoreResult:
     """
     Restaura automáticamente los archivos desde la cuarentena a sus ubicaciones originales
     utilizando el archivo manifest.json. Si todos los archivos son restaurados con éxito,
@@ -428,6 +438,7 @@ def restore_from_quarantine(manifest_path: Path | str) -> RestoreResult:
 
     Args:
         manifest_path: Ruta al archivo manifest.json generado durante la cuarentena.
+        require_signature: Exige la existencia obligatoria del archivo .sig (previene downgrade).
 
     Returns:
         RestoreResult con el balance de archivos restaurados y confirmación de eliminación.
@@ -436,8 +447,8 @@ def restore_from_quarantine(manifest_path: Path | str) -> RestoreResult:
     if not manifest_p.exists():
         raise FileNotFoundError(f"No se encontró el manifiesto de cuarentena: '{manifest_p}'")
 
-    # Verificación de integridad criptográfica y no repudio (NIST SSDF PO.4 / CNCF)
-    verify_manifest_signature(manifest_p)
+    # Verificación de integridad criptográfica y no repudio (NIST SSDF PO.4 / CNCF / CRIT-03)
+    verify_manifest_signature(manifest_p, require_signature=require_signature)
 
     quarantine_dir = manifest_p.parent
 
@@ -446,6 +457,9 @@ def restore_from_quarantine(manifest_path: Path | str) -> RestoreResult:
 
     # Soporte para ambas claves ("files" y "items")
     files_data = manifest_data.get("files") or manifest_data.get("items") or []
+    base_dir_str = manifest_data.get("base_dir")
+    base_dir_resolved = Path(base_dir_str).resolve().absolute() if base_dir_str else None
+
     total_restored = 0
     total_bytes_restored = 0
     skipped_count = 0
@@ -461,6 +475,14 @@ def restore_from_quarantine(manifest_path: Path | str) -> RestoreResult:
             continue
         q_path = Path(q_path_str)
         orig_path = Path(item["original_path"])
+        orig_resolved = orig_path.resolve().absolute()
+
+        # Seguridad: Prevenir Path Traversal hacia rutas arbitrarias o fuera de base_dir (CRIT-03)
+        if base_dir_resolved and not _is_subpath(orig_resolved, base_dir_resolved):
+            errors.append(
+                f"[SEGURIDAD] Intento de Path Traversal abortado: '{orig_path}' no es un subdirectorio de base_dir '{base_dir_str}'."
+            )
+            continue
 
         if not q_path.exists():
             errors.append(f"Archivo en cuarentena no encontrado: '{q_path}'")
@@ -475,7 +497,7 @@ def restore_from_quarantine(manifest_path: Path | str) -> RestoreResult:
             orig_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(q_path), str(orig_path))
             item["restored"] = True
-            item["restored_at"] = datetime.now().isoformat()
+            item["restored_at"] = get_utc_timestamp()
             total_restored += 1
             total_bytes_restored += item.get("size_bytes", 0)
         except Exception as e:
@@ -497,7 +519,7 @@ def restore_from_quarantine(manifest_path: Path | str) -> RestoreResult:
         # Actualizar manifiesto si quedaron archivos pendientes o con error y re-firmar
         manifest_data["files"] = files_data
         manifest_data["items"] = files_data
-        manifest_data["last_restored_at"] = datetime.now().isoformat()
+        manifest_data["last_restored_at"] = get_utc_timestamp()
         manifest_data["fully_restored"] = all_restored
         with open(manifest_p, "w", encoding="utf-8") as f:
             json.dump(manifest_data, f, indent=2, ensure_ascii=False)

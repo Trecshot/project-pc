@@ -197,8 +197,14 @@ class ManagedConnection(sqlite3.Connection):
             self.close()
 
 
-def _harden_file_permissions(file_path: Path) -> None:
-    """Restringe permisos del archivo a sólo el usuario creador (Principio de Menor Privilegio, NIST SSDF PO.5.1 / PW.5.1)."""
+_HARDENED_PATHS: set[str] = set()
+
+
+def _harden_file_permissions(file_path: Path, force: bool = False) -> None:
+    """Restringe permisos del archivo a sólo el usuario creador (Principio de Menor Privilegio, NIST SSDF PO.5.1 / PW.5.1 / MED-01)."""
+    resolved_key = str(file_path.resolve()) if file_path.exists() else str(file_path)
+    if not force and resolved_key in _HARDENED_PATHS:
+        return
     if not file_path.exists():
         return
     try:
@@ -211,6 +217,7 @@ def _harden_file_permissions(file_path: Path) -> None:
                 # Restringir acceso exclusivamente al usuario propietario actual (Windows DACL)
                 cmd = ["icacls", str(file_path), "/inheritance:r", "/grant:r", f"{username}:(F)"]
                 subprocess.run(cmd, shell=False, capture_output=True, check=False)
+        _HARDENED_PATHS.add(resolved_key)
     except (OSError, Exception) as e:
         logger.debug(f"No se pudieron ajustar permisos para {file_path}: {e}")
 
@@ -332,19 +339,13 @@ class CleaningHistoryManager:
             if "entry_hash" not in ops_cols:
                 conn.execute("ALTER TABLE operations_history ADD COLUMN entry_hash TEXT DEFAULT '';")
 
-            # Resellar cadenas legacy o corruptas con HMAC (Falla 3)
-            cur_check = conn.execute(
-                "SELECT entry_id, timestamp, action_type, target_dir, files_count, bytes_count, prev_hash, entry_hash "
-                "FROM operations_history ORDER BY rowid ASC LIMIT 1"
+            # Resellar exclusivamente registros legacy sin firma previa (CRIT-02)
+            # Jamás recalcular si ya existen firmas para preservar la evidencia ante adulteración
+            cur_unsealed = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM operations_history WHERE entry_hash = '' OR entry_hash IS NULL"
             ).fetchone()
-            if cur_check:
-                expected_first = compute_entry_hmac(
-                    "GENESIS", cur_check["entry_id"], cur_check["timestamp"],
-                    cur_check["action_type"], cur_check["target_dir"],
-                    cur_check["files_count"], cur_check["bytes_count"]
-                )
-                if cur_check["entry_hash"] != expected_first or not cur_check["entry_hash"]:
-                    reseal_legacy_audit_chain(conn)
+            if cur_unsealed and cur_unsealed["cnt"] > 0:
+                reseal_legacy_audit_chain(conn)
 
             conn.commit()
         # Mantenimiento preventivo: podar registros obsoletos (> 60 días)
